@@ -25,7 +25,7 @@ pub struct DesktopEntry {
 pub struct AppItem {
     pub name: String,
     pub version: String,
-    pub app_type: String, // "explicit", "dependency", "custom"
+    pub app_type: String,   // "explicit", "dependency", "custom"
     pub badge_code: String, // "PAC", "AUR", "SYS", "DEV", "FRK", "OPT", "NPM", "UV", "BIN", "SCR", "DEP"
     pub category_label: String,
     pub install_source: String, // "pacman", "paru", "custom"

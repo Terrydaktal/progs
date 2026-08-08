@@ -8,7 +8,6 @@ description = "Ultra-fast System Programs Manager written in Rust with egui"
 [dependencies]
 eframe = "0.28"
 egui = "0.28"
-rayon = "1.10"
 regex = "1.10"
 open = "5.1"
 arboard = "3.4"

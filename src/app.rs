@@ -134,7 +134,10 @@ impl ProgramManagerApp {
             let match_bin = app.binaries.iter().any(|b| {
                 b.name.to_lowercase().contains(&q) || b.target.to_lowercase().contains(&q)
             });
-            let match_req = app.required_by.iter().any(|r| r.to_lowercase().contains(&q));
+            let match_req = app
+                .required_by
+                .iter()
+                .any(|r| r.to_lowercase().contains(&q));
             if !(match_name || match_ver || match_cat || match_bin || match_req) {
                 return false;
             }
@@ -281,9 +284,7 @@ impl ProgramManagerApp {
             },
         );
 
-        let sub_deps = app_lookup
-            .map(|a| a.depends_on.clone())
-            .unwrap_or_default();
+        let sub_deps = app_lookup.map(|a| a.depends_on.clone()).unwrap_or_default();
 
         if sub_deps.is_empty() || depth + 1 >= max_depth {
             ui.label(job);
@@ -321,9 +322,8 @@ impl eframe::App for ProgramManagerApp {
                         .color(egui::Color32::from_rgb(56, 189, 248)),
                 );
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.search_query).hint_text(
-                        "🔍 Search programs, commands, dev projects, npm tools...",
-                    ),
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("🔍 Search programs, commands, dev projects, npm tools..."),
                 );
 
                 let all_btn_label = if self.are_all_filters_on() {
@@ -374,9 +374,7 @@ impl eframe::App for ProgramManagerApp {
                     ui.heading("Application Scale & UI Preferences");
                     ui.separator();
                     ui.label(egui::RichText::new("UI Zoom Scale (Pixels per Point):").strong());
-                    ui.add(
-                        egui::Slider::new(&mut self.app_scale, 0.75..=2.25).text("Zoom Scale"),
-                    );
+                    ui.add(egui::Slider::new(&mut self.app_scale, 0.75..=2.25).text("Zoom Scale"));
                     ui.separator();
                     ui.label("Quick Scale Presets:");
                     ui.horizontal(|ui| {
@@ -394,10 +392,7 @@ impl eframe::App for ProgramManagerApp {
                         }
                     });
                     ui.separator();
-                    ui.label(format!(
-                        "Current Pixels per Point: {:.2}",
-                        self.app_scale
-                    ));
+                    ui.label(format!("Current Pixels per Point: {:.2}", self.app_scale));
                     ui.separator();
                     if ui.button("Close Settings").clicked() {
                         self.show_settings_window = false;
