@@ -1,10 +1,14 @@
-use crate::models::{AppItem, BinaryInfo};
+use super::records::{upsert, StandaloneRecord};
+use crate::models::{AppItem, BinaryInfo, InstallOrigin, ProgramState};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 const SKIPPED_SUFFIXES: &[&str] = &[
     ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".bak", ".log", ".lock", ".desktop",
@@ -68,17 +72,31 @@ pub(super) fn scan(
             };
             let is_script = !is_symlink && has_shebang(&path);
             let is_broken = is_symlink && !resolved_target(&directory, &target).exists();
+            let project_version = if !is_broken && !is_pacman_owned {
+                let executable_path = resolved_target(&directory, &target);
+                project_version_for_path(&executable_path)
+            } else {
+                None
+            };
+            let discovered_version = project_version.clone().or_else(|| {
+                if is_broken || is_script || is_pacman_owned {
+                    None
+                } else {
+                    let executable_path = resolved_target(&directory, &target);
+                    embedded_binary_version(&executable_path, &name)
+                }
+            });
             let version = if is_broken {
-                "broken".to_string()
+                String::new()
             } else if is_pacman_owned {
                 package_versions
                     .get(&owning_package)
                     .map(|version| format!("v{version}"))
-                    .unwrap_or_else(|| "custom".to_string())
-            } else if is_script {
-                "script".to_string()
+                    .unwrap_or_default()
+            } else if let Some(version) = &discovered_version {
+                format!("v{version}")
             } else {
-                "custom/standalone".to_string()
+                String::new()
             };
             let binary = BinaryInfo {
                 name: name.clone(),
@@ -105,27 +123,27 @@ pub(super) fn scan(
                 is_script,
                 is_broken,
             });
-            let install_date = file_install_date(&path);
-            let entry_key = format!("{}:{name}", classification.badge);
-            let app = apps.entry(entry_key).or_insert_with(|| AppItem {
-                name,
-                version: "custom".to_string(),
-                app_type: "custom".to_string(),
-                badge_code: classification.badge,
-                category_label: classification.label,
-                install_source: "custom".to_string(),
-                size: "Local File".to_string(),
-                install_date,
-                desc: format!("Local custom tool sitting at {path_string}"),
-                url: String::new(),
-                licenses: "N/A".to_string(),
-                _owning_pkg: String::new(),
-                binaries: Vec::new(),
-                required_by: HashSet::new(),
-                depends_on: Vec::new(),
-                desktop_entries: Vec::new(),
-            });
-            app.binaries.push(binary);
+            let app_version = discovered_version
+                .as_deref()
+                .map(|version| format!("v{version}"))
+                .unwrap_or_default();
+            let key = upsert(
+                apps,
+                StandaloneRecord {
+                    name,
+                    version: app_version,
+                    origin: classification.origin,
+                    state: classification.state,
+                    description: format!("Local custom tool sitting at {path_string}"),
+                    binary: Some(binary),
+                },
+            );
+            if let Some(app) = apps.get_mut(&key) {
+                if app.install_date.is_empty() {
+                    app.install_date = file_install_date(&path);
+                }
+                app.size = "Local File".to_string();
+            }
         }
     }
 
@@ -162,6 +180,161 @@ fn file_install_date(path: &Path) -> String {
     "N/A".to_string()
 }
 
+fn project_version_for_path(path: &Path) -> Option<String> {
+    let mut current = if path.is_file() {
+        path.parent().map(Path::to_path_buf)
+    } else {
+        Some(path.to_path_buf())
+    };
+
+    while let Some(directory) = current.clone() {
+        for (manifest, section) in [("Cargo.toml", "[package]"), ("pyproject.toml", "[project]")] {
+            let manifest_path = directory.join(manifest);
+            if let Ok(contents) = std::fs::read_to_string(manifest_path) {
+                if let Some(version) = manifest_version(&contents, section) {
+                    return Some(version);
+                }
+            }
+        }
+
+        let parent = directory.parent().map(Path::to_path_buf);
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+
+    None
+}
+
+fn manifest_version(contents: &str, section: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == section;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "version" {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })?;
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn embedded_binary_version(path: &Path, identity: &str) -> Option<String> {
+    let metadata = path.metadata().ok()?;
+    if metadata.len() > 256 * 1024 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let strings = printable_strings(&bytes);
+    version_from_identity_context(&strings, identity)
+}
+
+fn printable_strings(bytes: &[u8]) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut current = Vec::new();
+
+    for &byte in bytes {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            current.push(byte);
+        } else {
+            if current.len() >= 4 {
+                strings.push(String::from_utf8_lossy(&current).into_owned());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 4 {
+        strings.push(String::from_utf8_lossy(&current).into_owned());
+    }
+    strings
+}
+
+fn version_from_identity_context(strings: &[String], identity: &str) -> Option<String> {
+    let identity = identity.to_lowercase();
+    if identity.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(usize, usize, String)> = None;
+    for (index, value) in strings.iter().enumerate() {
+        if !value.to_lowercase().contains(&identity) {
+            continue;
+        }
+        let identity_versions = embedded_version_candidates(value);
+
+        let start = index.saturating_sub(3);
+        let end = (index + 4).min(strings.len());
+        for (candidate_index, candidate) in strings[start..end].iter().enumerate() {
+            let distance = (start + candidate_index).abs_diff(index);
+            for version in embedded_version_candidates(candidate) {
+                let components = version.split('.').count();
+                let is_after_identity = start + candidate_index >= index;
+                let corroborated = identity_versions.iter().any(|identity_version| {
+                    version == *identity_version
+                        || version.starts_with(&format!("{identity_version}."))
+                });
+                let score = components * 100usize + usize::from(corroborated) * 1_000
+                    - distance * 10
+                    + usize::from(is_after_identity);
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_score, _, _)| score > *best_score)
+                {
+                    best = Some((score, distance, version));
+                }
+            }
+        }
+    }
+
+    best.map(|(_, _, version)| version)
+}
+
+fn embedded_version_candidates(value: &str) -> Vec<String> {
+    version_pattern()
+        .find_iter(value)
+        .filter_map(|matched| {
+            let bytes = value.as_bytes();
+            if (matched.start() > 0 && bytes[matched.start() - 1] == b'.')
+                || (matched.end() < bytes.len() && bytes[matched.end()] == b'.')
+            {
+                return None;
+            }
+            let version = matched.as_str().trim_start_matches('v');
+            if version.split('.').all(|component| component == "0") {
+                return None;
+            }
+            Some(version.to_string())
+        })
+        .collect()
+}
+
+fn version_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"\b(?:v)?\d+\.\d+(?:\.\d+)?\b").unwrap())
+}
+
 struct CustomExecutable<'a> {
     path: &'a str,
     target: &'a str,
@@ -171,8 +344,8 @@ struct CustomExecutable<'a> {
 }
 
 struct Classification {
-    badge: String,
-    label: String,
+    origin: InstallOrigin,
+    state: ProgramState,
 }
 
 fn classify_custom(executable: &CustomExecutable<'_>) -> Classification {
@@ -181,38 +354,85 @@ fn classify_custom(executable: &CustomExecutable<'_>) -> Classification {
     } else {
         executable.target
     };
-    let (badge, label) = if executable.is_broken {
-        ("BRK", "Broken Symlink / Missing Target")
+    if executable.is_broken {
+        Classification {
+            origin: InstallOrigin::Local,
+            state: ProgramState {
+                broken: true,
+                ..ProgramState::default()
+            },
+        }
     } else if executable.target.contains("node_modules") || executable.path.contains("node_modules")
     {
-        ("NPM", "Node.js Global Tool (npm)")
+        Classification {
+            origin: InstallOrigin::Npm,
+            state: ProgramState::default(),
+        }
     } else if executable.target.contains("/.local/share/uv/")
         || executable.path.contains("/.local/share/uv/")
     {
-        ("UV", "Python Tool (uv)")
+        Classification {
+            origin: InstallOrigin::Uv,
+            state: ProgramState::default(),
+        }
+    } else if executable.target.contains("/.cargo/bin/") || executable.path.contains("/.cargo/bin/")
+    {
+        Classification {
+            origin: InstallOrigin::Cargo,
+            state: ProgramState::default(),
+        }
     } else if git_target.contains("/Dev/")
         || git_target.contains("/dev/")
         || executable.path.contains("/Dev/")
         || executable.path.contains("/dev/")
     {
-        ("DEV", "Personal Dev Project (~/Dev)")
+        Classification {
+            origin: InstallOrigin::Local,
+            state: ProgramState {
+                dev: true,
+                ..ProgramState::default()
+            },
+        }
     } else if git_target.contains("/repos/") || executable.path.contains("/repos/") {
-        return inspect_git_repo(git_target).unwrap_or_else(|| Classification {
-            badge: "UNC".to_string(),
-            label: "Unclassified Executable".to_string(),
-        });
+        inspect_git_repo(git_target).unwrap_or_else(|| Classification {
+            origin: InstallOrigin::Local,
+            state: ProgramState {
+                unclassified: true,
+                ..ProgramState::default()
+            },
+        })
     } else if executable.target.contains("/opt/") || executable.path.contains("/opt/") {
-        ("OPT", "Binary Bundle / AppImage (/opt)")
+        Classification {
+            origin: InstallOrigin::Local,
+            state: ProgramState {
+                opt: true,
+                ..ProgramState::default()
+            },
+        }
     } else if !executable.is_symlink && executable.is_script {
-        ("SCR", "Local Script (~/.local/bin)")
+        Classification {
+            origin: InstallOrigin::Local,
+            state: ProgramState {
+                script: true,
+                ..ProgramState::default()
+            },
+        }
     } else if !executable.is_symlink {
-        ("BIN", "Standalone Binary (~/.local/bin)")
+        Classification {
+            origin: InstallOrigin::Local,
+            state: ProgramState {
+                binary: true,
+                ..ProgramState::default()
+            },
+        }
     } else {
-        ("UNC", "Unclassified Executable")
-    };
-    Classification {
-        badge: badge.to_string(),
-        label: label.to_string(),
+        Classification {
+            origin: InstallOrigin::Local,
+            state: ProgramState {
+                unclassified: true,
+                ..ProgramState::default()
+            },
+        }
     }
 }
 
@@ -250,29 +470,20 @@ fn inspect_git_repo(target_path: &str) -> Option<Classification> {
 
             if !is_fork {
                 return Some(Classification {
-                    badge: "CLO".to_string(),
-                    label: "Cloned Upstream Repo (Clean, 1 remote)".to_string(),
+                    origin: InstallOrigin::Local,
+                    state: ProgramState {
+                        cloned: true,
+                        ..ProgramState::default()
+                    },
                 });
             }
 
-            let mut reasons = Vec::new();
-            if has_multiple_remotes || has_user_fork || has_fork_remote {
-                reasons.push(format!("{} remotes", remote_names.len()));
-            }
-            if is_dirty {
-                reasons.push(format!("{} dirty files", status.lines().count()));
-            }
-            if ahead > 0 {
-                reasons.push(format!("{ahead} commits ahead"));
-            }
-            let label = if reasons.is_empty() {
-                "Git Fork Repo (~/repos)".to_string()
-            } else {
-                format!("Git Fork Repo ({})", reasons.join(", "))
-            };
             return Some(Classification {
-                badge: "FRK".to_string(),
-                label,
+                origin: InstallOrigin::Local,
+                state: ProgramState {
+                    fork: true,
+                    ..ProgramState::default()
+                },
             });
         }
         let parent = directory.parent().map(Path::to_path_buf);
@@ -321,10 +532,47 @@ mod tests {
     }
 
     #[test]
-    fn classification_preserves_priority_and_badges() {
+    fn reads_declared_project_versions_for_local_tools() {
         assert_eq!(
-            classification("/home/test/.local/bin/tool", "missing", true, false, true).badge,
-            "BRK"
+            manifest_version(
+                "[package]\nname = \"tool\"\nversion = \"0.2.6\"",
+                "[package]"
+            ),
+            Some("0.2.6".to_string())
+        );
+        assert_eq!(
+            manifest_version("[project]\nversion = '1.4.0'", "[project]"),
+            Some("1.4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_embedded_versions_near_the_binary_identity() {
+        let strings = vec![
+            "unrelated 1.2.3".to_string(),
+            "0.0.0.0".to_string(),
+            "3.38.1".to_string(),
+            "Tixati/3.38-64".to_string(),
+        ];
+        assert_eq!(
+            version_from_identity_context(&strings, "tixati"),
+            Some("3.38.1".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_ip_addresses_and_all_zero_embedded_versions() {
+        assert!(embedded_version_candidates("0.0.0.0").is_empty());
+        assert!(embedded_version_candidates("127.0.0.1").is_empty());
+        assert!(embedded_version_candidates("version 0.0.0").is_empty());
+    }
+
+    #[test]
+    fn classification_preserves_priority_and_facets() {
+        assert!(
+            classification("/home/test/.local/bin/tool", "missing", true, false, true)
+                .state
+                .broken
         );
         assert_eq!(
             classification(
@@ -334,10 +582,10 @@ mod tests {
                 false,
                 false,
             )
-            .badge,
-            "NPM"
+            .origin,
+            InstallOrigin::Npm
         );
-        assert_eq!(
+        assert!(
             classification(
                 "/home/test/.local/bin/tool",
                 "/home/test/Dev/tool/target/release/tool",
@@ -345,18 +593,20 @@ mod tests {
                 false,
                 false,
             )
-            .badge,
-            "DEV"
+            .state
+            .dev
         );
-        assert_eq!(
-            classification("/home/test/.local/bin/tool", "", false, true, false).badge,
-            "SCR"
+        assert!(
+            classification("/home/test/.local/bin/tool", "", false, true, false)
+                .state
+                .script
         );
-        assert_eq!(
-            classification("/home/test/.local/bin/tool", "", false, false, false).badge,
-            "BIN"
+        assert!(
+            classification("/home/test/.local/bin/tool", "", false, false, false)
+                .state
+                .binary
         );
-        assert_eq!(
+        assert!(
             classification(
                 "/home/test/.local/bin/tool",
                 "elsewhere",
@@ -364,8 +614,8 @@ mod tests {
                 false,
                 false
             )
-            .badge,
-            "UNC"
+            .state
+            .unclassified
         );
     }
 }

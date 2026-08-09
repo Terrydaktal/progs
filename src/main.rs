@@ -1,6 +1,8 @@
 mod app;
+mod dependency_graph;
 mod models;
 mod scanner;
+mod search;
 
 use app::ProgramManagerApp;
 use eframe::egui;
