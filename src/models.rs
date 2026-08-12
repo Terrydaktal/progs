@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BinaryInfo {
     pub name: String,
     pub dir: String,
@@ -12,7 +13,7 @@ pub struct BinaryInfo {
     pub _owning_pkg: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DesktopEntry {
     pub file_path: String,
     pub name: String,
@@ -23,7 +24,7 @@ pub struct DesktopEntry {
     pub runs_in_terminal: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ServiceKind {
     Daemon,
     Job,
@@ -38,7 +39,7 @@ impl ServiceKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServiceInfo {
     pub name: String,
     pub file_path: String,
@@ -51,7 +52,7 @@ pub struct ServiceInfo {
     pub broken: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PackageCapabilities {
     pub has_gui: bool,
     pub has_cli: bool,
@@ -114,7 +115,7 @@ impl PackageCapabilities {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InstallOrigin {
     Pacman,
     Aur,
@@ -129,9 +130,9 @@ impl InstallOrigin {
         match self {
             Self::Pacman => "PAC",
             Self::Aur => "AUR",
-            Self::Uv => "UV",
+            Self::Uv => "UVM",
             Self::Npm => "NPM",
-            Self::Cargo => "CAR",
+            Self::Cargo => "CAM",
             Self::Local => "LOC",
         }
     }
@@ -146,13 +147,29 @@ impl InstallOrigin {
             Self::Local => "Local",
         }
     }
+
+    pub fn badge_code(self, role: InstallRole) -> &'static str {
+        match (self, role) {
+            (Self::Pacman, InstallRole::Explicit) => "PEM",
+            (Self::Pacman, InstallRole::Dependency) => "PDM",
+            (Self::Pacman, _) => "PSM",
+            (Self::Aur, InstallRole::Explicit) => "AEM",
+            (Self::Aur, InstallRole::Dependency) => "ADM",
+            (Self::Aur, _) => "ASM",
+            (Self::Uv, _) => "UVM",
+            (Self::Npm, _) => "NPM",
+            (Self::Cargo, _) => "CAM",
+            (Self::Local, _) => "UNC",
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InstallRole {
     Explicit,
     Dependency,
     Standalone,
+    ToolchainManaged,
 }
 
 impl InstallRole {
@@ -161,15 +178,21 @@ impl InstallRole {
             Self::Explicit => "Explicit",
             Self::Dependency => "Dependency",
             Self::Standalone => "Standalone",
+            Self::ToolchainManaged => "Toolchain-managed",
         }
     }
 
     pub fn is_explicit(self) -> bool {
         self == Self::Explicit
     }
+
+    pub fn is_external(self) -> bool {
+        matches!(self, Self::Standalone | Self::ToolchainManaged)
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ProgramState {
     pub dev: bool,
     pub fork: bool,
@@ -179,6 +202,7 @@ pub struct ProgramState {
     pub binary: bool,
     pub script: bool,
     pub opt: bool,
+    pub orphan: bool,
 }
 
 impl ProgramState {
@@ -199,14 +223,17 @@ impl ProgramState {
         if self.broken {
             tags.push("BROKEN");
         }
+        if self.orphan {
+            tags.push("ORPHAN");
+        }
         if self.binary {
-            tags.push("BIN");
+            tags.push("BIU");
         }
         if self.script {
-            tags.push("SCRIPT");
+            tags.push("SCU");
         }
         if self.opt {
-            tags.push("OPT");
+            tags.push("OPM");
         }
         if tags.is_empty() {
             "".to_string()
@@ -216,7 +243,7 @@ impl ProgramState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppItem {
     pub name: String,
     pub version: String,
@@ -229,6 +256,7 @@ pub struct AppItem {
     pub url: String,
     pub licenses: String,
     pub _owning_pkg: String,
+    pub representative_path: String,
     pub binaries: Vec<BinaryInfo>,
     pub required_by: HashSet<String>,
     pub depends_on: Vec<String>,
@@ -238,45 +266,44 @@ pub struct AppItem {
 }
 
 impl AppItem {
-    pub fn is_one_to_one_standalone_tool(&self) -> bool {
-        self.install_role == InstallRole::Standalone
-            && self.binaries.len() == 1
-            && self.binaries[0].name == self.name
+    pub fn is_one_to_one_tool(&self) -> bool {
+        self.binaries.len() == 1 && self.binaries[0].name == self.name
+    }
+
+    pub fn is_suite(&self) -> bool {
+        self.binaries.len() > 1 && self.capabilities.has_cli
     }
 
     pub fn display_badge(&self) -> &'static str {
-        // Keep the compact legacy badge for the list/tree while retaining
-        // origin, install role, state, and capabilities as independent data.
-        if self.origin == InstallOrigin::Aur {
-            "AUR"
+        // Keep special state badges, otherwise expose package reason or the
+        // stable identifying source/class code.
+        if self.state.orphan && matches!(self.origin, InstallOrigin::Pacman | InstallOrigin::Aur) {
+            "POM"
+        } else if self.origin == InstallOrigin::Aur {
+            self.origin.badge_code(self.install_role)
         } else if self.state.broken {
             "BRK"
-        } else if self.origin == InstallOrigin::Npm {
-            "NPM"
-        } else if self.origin == InstallOrigin::Uv {
-            "UV"
-        } else if self.origin == InstallOrigin::Cargo {
-            "CAR"
+        } else if matches!(
+            self.origin,
+            InstallOrigin::Npm | InstallOrigin::Uv | InstallOrigin::Cargo
+        ) {
+            self.origin.badge_code(self.install_role)
         } else if self.state.dev {
-            "DEV"
+            "DVM"
         } else if self.state.fork {
-            "FRK"
+            "FKM"
         } else if self.state.cloned {
-            "CLO"
+            "CLM"
         } else if self.state.unclassified {
             "UNC"
         } else if self.state.opt {
-            "OPT"
+            "OPM"
         } else if self.state.script {
-            "SCR"
+            "SCU"
         } else if self.state.binary {
-            "BIN"
-        } else if self.origin == InstallOrigin::Pacman {
-            "PAC"
-        } else if self.install_role == InstallRole::Standalone {
-            "CST"
+            "BIU"
         } else {
-            "DEP"
+            self.origin.badge_code(self.install_role)
         }
     }
 
@@ -308,10 +335,297 @@ impl AppItem {
         }
         format!("({})", suffixes.join(", "))
     }
+
+    pub fn installation_summary(&self) -> String {
+        let source = self.installation_source_label();
+        let identity = match self.origin {
+            InstallOrigin::Pacman | InstallOrigin::Aur => {
+                format!("{source} {}", self.install_role.label())
+            }
+            InstallOrigin::Uv
+            | InstallOrigin::Npm
+            | InstallOrigin::Cargo
+            | InstallOrigin::Local => source.to_string(),
+        };
+        format!("{identity} ({})", self.installation_management_label())
+    }
+
+    fn installation_management_label(&self) -> &'static str {
+        match self.origin {
+            InstallOrigin::Pacman | InstallOrigin::Aur => "Package-managed",
+            InstallOrigin::Uv | InstallOrigin::Npm | InstallOrigin::Cargo => "Toolchain-managed",
+            InstallOrigin::Local if self.state.broken => "Broken",
+            InstallOrigin::Local if self.state.dev || self.state.fork || self.state.cloned => {
+                "Source-managed"
+            }
+            InstallOrigin::Local if self.state.unclassified => "Unclassified",
+            InstallOrigin::Local if self.state.opt => "Vendor-managed",
+            InstallOrigin::Local
+                if !self.state.script
+                    && !self.state.binary
+                    && !self.state.dev
+                    && !self.state.fork
+                    && !self.state.cloned =>
+            {
+                "Unclassified"
+            }
+            InstallOrigin::Local => "Unmanaged",
+        }
+    }
+
+    fn installation_source_label(&self) -> &'static str {
+        match self.origin {
+            InstallOrigin::Pacman => "Pacman",
+            InstallOrigin::Aur => "AUR",
+            InstallOrigin::Uv => "uv",
+            InstallOrigin::Npm => "npm",
+            InstallOrigin::Cargo => "Cargo",
+            InstallOrigin::Local if self.state.broken => "BRK",
+            InstallOrigin::Local if self.state.dev => "DEV",
+            InstallOrigin::Local if self.state.fork => "Fork",
+            InstallOrigin::Local if self.state.cloned => "Git Clone",
+            InstallOrigin::Local if self.state.unclassified => "UNC",
+            InstallOrigin::Local if self.state.opt => "opt",
+            InstallOrigin::Local if self.state.script => "SCU",
+            InstallOrigin::Local if self.state.binary => "BIU",
+            InstallOrigin::Local => "UNC",
+        }
+    }
 }
 
+#[derive(Deserialize, Serialize)]
 pub struct ScanResult {
     pub apps: Vec<AppItem>,
     pub provides_map: HashMap<String, String>,
     pub _stats: (usize, usize, usize, usize, usize), // explicit, deps, binaries, symlinks, aur
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppItem, InstallOrigin, InstallRole, PackageCapabilities, ProgramState};
+    use std::collections::HashSet;
+
+    #[test]
+    fn badge_codes_are_three_character_and_unambiguous() {
+        assert_eq!(
+            InstallOrigin::Pacman.badge_code(InstallRole::Explicit),
+            "PEM"
+        );
+        assert_eq!(
+            InstallOrigin::Pacman.badge_code(InstallRole::Dependency),
+            "PDM"
+        );
+        assert_eq!(InstallOrigin::Aur.badge_code(InstallRole::Explicit), "AEM");
+        assert_eq!(
+            InstallOrigin::Aur.badge_code(InstallRole::Dependency),
+            "ADM"
+        );
+        assert_eq!(InstallOrigin::Uv.badge_code(InstallRole::Standalone), "UVM");
+        assert_eq!(
+            InstallOrigin::Npm.badge_code(InstallRole::Standalone),
+            "NPM"
+        );
+        assert_eq!(
+            InstallOrigin::Cargo.badge_code(InstallRole::Standalone),
+            "CAM"
+        );
+        assert_eq!(
+            InstallOrigin::Local.badge_code(InstallRole::Standalone),
+            "UNC"
+        );
+        for badge in [
+            "PEM", "PDM", "AEM", "ADM", "POM", "UVM", "NPM", "CAM", "UNC",
+        ] {
+            assert_eq!(badge.len(), 3);
+        }
+        assert_eq!(
+            app(
+                InstallOrigin::Pacman,
+                InstallRole::Dependency,
+                ProgramState {
+                    orphan: true,
+                    ..ProgramState::default()
+                }
+            )
+            .display_badge(),
+            "POM"
+        );
+
+        let state_badges = [
+            (
+                ProgramState {
+                    dev: true,
+                    ..ProgramState::default()
+                },
+                "DVM",
+            ),
+            (
+                ProgramState {
+                    fork: true,
+                    ..ProgramState::default()
+                },
+                "FKM",
+            ),
+            (
+                ProgramState {
+                    cloned: true,
+                    ..ProgramState::default()
+                },
+                "CLM",
+            ),
+            (
+                ProgramState {
+                    unclassified: true,
+                    ..ProgramState::default()
+                },
+                "UNC",
+            ),
+            (
+                ProgramState {
+                    broken: true,
+                    ..ProgramState::default()
+                },
+                "BRK",
+            ),
+            (
+                ProgramState {
+                    opt: true,
+                    ..ProgramState::default()
+                },
+                "OPM",
+            ),
+            (
+                ProgramState {
+                    script: true,
+                    ..ProgramState::default()
+                },
+                "SCU",
+            ),
+            (
+                ProgramState {
+                    binary: true,
+                    ..ProgramState::default()
+                },
+                "BIU",
+            ),
+        ];
+        for (state, expected) in state_badges {
+            assert_eq!(
+                app(InstallOrigin::Local, InstallRole::Standalone, state).display_badge(),
+                expected
+            );
+            assert_eq!(expected.len(), 3);
+        }
+    }
+
+    #[test]
+    fn toolchain_installations_have_a_distinct_role_label() {
+        assert_eq!(InstallRole::ToolchainManaged.label(), "Toolchain-managed");
+        assert!(InstallRole::ToolchainManaged.is_external());
+        assert!(InstallRole::Standalone.is_external());
+        assert!(!InstallRole::Explicit.is_external());
+        assert!(!InstallRole::Dependency.is_external());
+    }
+
+    fn app(origin: InstallOrigin, role: InstallRole, state: ProgramState) -> AppItem {
+        AppItem {
+            name: "tool".to_string(),
+            version: String::new(),
+            origin,
+            install_role: role,
+            state,
+            size: String::new(),
+            install_date: String::new(),
+            desc: String::new(),
+            url: String::new(),
+            licenses: String::new(),
+            _owning_pkg: String::new(),
+            representative_path: String::new(),
+            binaries: Vec::new(),
+            required_by: HashSet::new(),
+            depends_on: Vec::new(),
+            desktop_entries: Vec::new(),
+            services: Vec::new(),
+            capabilities: PackageCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn installation_summary_exposes_management_category() {
+        assert_eq!(
+            app(
+                InstallOrigin::Pacman,
+                InstallRole::Explicit,
+                ProgramState::default()
+            )
+            .installation_summary(),
+            "Pacman Explicit (Package-managed)"
+        );
+        assert_eq!(
+            app(
+                InstallOrigin::Cargo,
+                InstallRole::ToolchainManaged,
+                ProgramState::default()
+            )
+            .installation_summary(),
+            "Cargo (Toolchain-managed)"
+        );
+        assert_eq!(
+            app(
+                InstallOrigin::Local,
+                InstallRole::Standalone,
+                ProgramState {
+                    opt: true,
+                    ..ProgramState::default()
+                }
+            )
+            .installation_summary(),
+            "opt (Vendor-managed)"
+        );
+        assert_eq!(
+            app(
+                InstallOrigin::Local,
+                InstallRole::Standalone,
+                ProgramState {
+                    cloned: true,
+                    ..ProgramState::default()
+                }
+            )
+            .installation_summary(),
+            "Git Clone (Source-managed)"
+        );
+        assert_eq!(
+            app(
+                InstallOrigin::Local,
+                InstallRole::Standalone,
+                ProgramState {
+                    fork: true,
+                    ..ProgramState::default()
+                }
+            )
+            .installation_summary(),
+            "Fork (Source-managed)"
+        );
+        assert_eq!(
+            app(
+                InstallOrigin::Local,
+                InstallRole::Standalone,
+                ProgramState::default()
+            )
+            .installation_summary(),
+            "UNC (Unclassified)"
+        );
+        assert_eq!(
+            app(
+                InstallOrigin::Local,
+                InstallRole::Standalone,
+                ProgramState {
+                    binary: true,
+                    ..ProgramState::default()
+                }
+            )
+            .installation_summary(),
+            "BIU (Unmanaged)"
+        );
+    }
 }

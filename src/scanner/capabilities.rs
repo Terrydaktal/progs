@@ -1,5 +1,5 @@
 use super::desktop::desktop_exec_command;
-use crate::models::{AppItem, InstallRole, PackageCapabilities};
+use crate::models::{AppItem, PackageCapabilities};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -30,7 +30,7 @@ pub(super) fn classify(apps: &mut HashMap<String, AppItem>, file_owners: &HashMa
         let evidence = evidence_by_package
             .remove(app.name.as_str())
             .unwrap_or_default();
-        let is_custom = app.install_role == InstallRole::Standalone;
+        let is_custom = app.install_role.is_external();
         let has_service = evidence.has_persistent_service
             || app.services.iter().any(|service| {
                 service.kind == crate::models::ServiceKind::Daemon && !service.broken
@@ -289,7 +289,7 @@ fn completion_command(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{BinaryInfo, DesktopEntry, InstallOrigin, ProgramState};
+    use crate::models::{BinaryInfo, DesktopEntry, InstallOrigin, InstallRole, ProgramState};
 
     #[test]
     fn owned_paths_identify_public_library_plugin_and_cli_evidence() {
@@ -410,6 +410,7 @@ mod tests {
             url: String::new(),
             licenses: String::new(),
             _owning_pkg: String::new(),
+            representative_path: String::new(),
             binaries: vec![BinaryInfo {
                 name: name.to_string(),
                 dir: "/tmp".to_string(),

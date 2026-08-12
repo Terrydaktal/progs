@@ -1,3 +1,4 @@
+mod cache;
 mod capabilities;
 mod cargo;
 mod desktop;
@@ -24,6 +25,7 @@ pub fn scan_system() -> ScanResult {
     desktop::scan_and_attach(&mut apps, &snapshot.file_owners);
     services::scan_and_attach(&mut apps, &snapshot.file_owners);
     capabilities::classify(&mut apps, &snapshot.file_owners);
+    records::assign_representative_paths(&mut apps, &snapshot.file_owners);
 
     let mut apps: Vec<AppItem> = apps.into_values().collect();
     apps.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
@@ -53,6 +55,16 @@ pub fn scan_system() -> ScanResult {
     }
 }
 
+pub fn load_cached_scan() -> Option<ScanResult> {
+    cache::load()
+}
+
+pub fn refresh_system_scan() -> ScanResult {
+    let result = scan_system();
+    cache::store(&result);
+    result
+}
+
 fn package_apps(snapshot: &PacmanSnapshot) -> HashMap<String, AppItem> {
     let mut apps = HashMap::new();
 
@@ -73,6 +85,7 @@ fn package_apps(snapshot: &PacmanSnapshot) -> HashMap<String, AppItem> {
                 PackagePresentation {
                     role: InstallRole::Explicit,
                     origin,
+                    state: ProgramState::default(),
                 },
                 metadata,
                 required_by,
@@ -97,6 +110,10 @@ fn package_apps(snapshot: &PacmanSnapshot) -> HashMap<String, AppItem> {
                 PackagePresentation {
                     role: InstallRole::Dependency,
                     origin,
+                    state: ProgramState {
+                        orphan: snapshot.orphan_packages.contains(package),
+                        ..ProgramState::default()
+                    },
                 },
                 metadata,
                 required_by,
@@ -120,6 +137,7 @@ fn package_reverse_dependencies(snapshot: &PacmanSnapshot, package: &str) -> Has
 struct PackagePresentation {
     role: InstallRole,
     origin: InstallOrigin,
+    state: ProgramState,
 }
 
 fn package_app(
@@ -134,13 +152,14 @@ fn package_app(
         version: version.to_string(),
         origin: presentation.origin,
         install_role: presentation.role,
-        state: ProgramState::default(),
+        state: presentation.state,
         size: metadata.size,
         install_date: metadata.install_date,
         desc: metadata.description,
         url: metadata.url,
         licenses: metadata.licenses,
         _owning_pkg: package.to_string(),
+        representative_path: String::new(),
         binaries: Vec::new(),
         required_by,
         depends_on: metadata.depends_on,
@@ -158,7 +177,11 @@ mod tests {
     fn explicit_packages_retain_reverse_dependency_edges() {
         let snapshot = PacmanSnapshot {
             explicit: HashMap::from([("root-tool".to_string(), "1.0".to_string())]),
-            dependencies: HashMap::from([("coreutils".to_string(), "9.11".to_string())]),
+            dependencies: HashMap::from([
+                ("coreutils".to_string(), "9.11".to_string()),
+                ("orphan-lib".to_string(), "1.0".to_string()),
+            ]),
+            orphan_packages: HashSet::from(["orphan-lib".to_string()]),
             aur_packages: HashSet::new(),
             metadata: HashMap::new(),
             provides: HashMap::new(),
@@ -174,10 +197,12 @@ mod tests {
             apps["root-tool"].required_by,
             HashSet::from(["another-root".to_string()])
         );
-        assert_eq!(apps["root-tool"].display_badge(), "PAC");
+        assert_eq!(apps["root-tool"].display_badge(), "PEM");
         assert_eq!(apps["root-tool"].install_role, InstallRole::Explicit);
-        assert_eq!(apps["coreutils"].display_badge(), "PAC");
+        assert_eq!(apps["coreutils"].display_badge(), "PDM");
         assert_eq!(apps["coreutils"].install_role, InstallRole::Dependency);
+        assert_eq!(apps["orphan-lib"].display_badge(), "POM");
+        assert!(apps["orphan-lib"].state.orphan);
     }
 
     #[test]
@@ -226,6 +251,46 @@ mod tests {
         }
         if let Some(plasma_meta) = result.apps.iter().find(|app| app.name == "plasma-meta") {
             assert!(plasma_meta.capabilities.is_meta);
+        }
+
+        let missing_locations: Vec<&str> = result
+            .apps
+            .iter()
+            .filter(|app| app.representative_path.is_empty())
+            .map(|app| app.name.as_str())
+            .collect();
+        assert!(
+            missing_locations.is_empty(),
+            "discovered programs without representative locations: {missing_locations:?}"
+        );
+
+        for non_program_path in [
+            "/home/lewis/repos/nvtop/LICENSE",
+            "/home/lewis/.config/mimeapps.list",
+            "/home/lewis/repos/fish-shell/fish.png",
+            "/home/lewis/repos/fpc-9924-driver/FpcDisumEngine.dll",
+            "/home/lewis/Dev/diarise/Recording_1828.mp3",
+            "/home/lewis/repos/pcmanfm/missing",
+        ] {
+            assert!(
+                result.apps.iter().all(|app| app
+                    .binaries
+                    .iter()
+                    .all(|binary| binary.path != non_program_path)),
+                "non-program file was admitted as an executable: {non_program_path}"
+            );
+        }
+
+        if let Some(bat) = result.apps.iter().find(|app| app.name == "bat") {
+            assert!(bat.is_one_to_one_tool());
+            assert_eq!(bat.representative_path, "/usr/bin/bat");
+        }
+        if let Some(acl) = result.apps.iter().find(|app| app.name == "acl") {
+            assert!(!acl.is_one_to_one_tool());
+            assert_eq!(acl.representative_path, "/usr/bin");
+        }
+        if let Some(glibc) = result.apps.iter().find(|app| app.name == "glibc") {
+            assert_eq!(glibc.representative_path, "/usr/lib/libc.so.6");
         }
         if let Some(alsa_utils) = result.apps.iter().find(|app| app.name == "alsa-utils") {
             assert!(alsa_utils.capabilities.has_cli);

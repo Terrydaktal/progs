@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub(super) struct StandaloneRecord {
     pub name: String,
@@ -17,19 +18,40 @@ pub(super) struct StandaloneRecord {
 }
 
 pub(super) fn upsert(apps: &mut HashMap<String, AppItem>, record: StandaloneRecord) -> String {
-    let existing_key = record
-        .binary
-        .as_ref()
-        .and_then(|binary| app_key_for_path(apps, Path::new(&binary.path)));
+    upsert_internal(apps, record, true)
+}
+
+pub(super) fn upsert_without_path_merge(
+    apps: &mut HashMap<String, AppItem>,
+    record: StandaloneRecord,
+) -> String {
+    upsert_internal(apps, record, false)
+}
+
+fn upsert_internal(
+    apps: &mut HashMap<String, AppItem>,
+    record: StandaloneRecord,
+    merge_by_binary_path: bool,
+) -> String {
+    let record_role = discovered_install_role(record.origin);
+    let existing_key = merge_by_binary_path
+        .then(|| {
+            record
+                .binary
+                .as_ref()
+                .and_then(|binary| app_key_for_path(apps, Path::new(&binary.path)))
+        })
+        .flatten();
 
     if let Some(key) = existing_key {
         let app = apps.get_mut(&key).expect("matched application disappeared");
-        if app.install_role == InstallRole::Standalone {
+        if app.install_role.is_external() {
             if app.version.is_empty() && !record.version.is_empty() {
                 app.version = record.version;
             }
             if origin_is_more_specific(record.origin, app.origin) {
                 app.origin = record.origin;
+                app.install_role = record_role;
                 app.state = record.state;
             } else if record.state.broken {
                 app.state.broken = true;
@@ -52,7 +74,7 @@ pub(super) fn upsert(apps: &mut HashMap<String, AppItem>, record: StandaloneReco
         name: record.name,
         version: record.version,
         origin: record.origin,
-        install_role: InstallRole::Standalone,
+        install_role: record_role,
         state: record.state,
         size: "Local installation".to_string(),
         install_date: String::new(),
@@ -60,6 +82,7 @@ pub(super) fn upsert(apps: &mut HashMap<String, AppItem>, record: StandaloneReco
         url: String::new(),
         licenses: "N/A".to_string(),
         _owning_pkg: String::new(),
+        representative_path: String::new(),
         binaries: Vec::new(),
         required_by: HashSet::new(),
         depends_on: Vec::new(),
@@ -73,8 +96,222 @@ pub(super) fn upsert(apps: &mut HashMap<String, AppItem>, record: StandaloneReco
     key
 }
 
+pub(super) fn assign_representative_paths(
+    apps: &mut HashMap<String, AppItem>,
+    file_owners: &HashMap<String, String>,
+) {
+    let mut paths_by_package: HashMap<&str, Vec<&str>> = HashMap::new();
+    let package_database_paths = pacman_database_paths();
+    for (path, package) in file_owners {
+        paths_by_package
+            .entry(package.as_str())
+            .or_default()
+            .push(path.as_str());
+    }
+
+    for app in apps.values_mut() {
+        let owned_paths = paths_by_package
+            .get(app._owning_pkg.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let Some(path) = representative_path(app, owned_paths) {
+            app.representative_path = path;
+        } else if app.representative_path.is_empty() {
+            app.representative_path = package_database_paths
+                .get(app._owning_pkg.as_str())
+                .cloned()
+                .or_else(|| {
+                    app.services
+                        .iter()
+                        .map(|service| service.file_path.clone())
+                        .min()
+                })
+                .unwrap_or_default();
+        }
+    }
+}
+
+fn pacman_database_paths() -> HashMap<String, String> {
+    let Ok(entries) = std::fs::read_dir("/var/lib/pacman/local") else {
+        return HashMap::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let desc = std::fs::read_to_string(path.join("desc")).ok()?;
+            let name = desc
+                .lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|lines| (lines[0] == "%NAME%").then(|| lines[1].to_string()))?;
+            Some((name, path.to_string_lossy().to_string()))
+        })
+        .collect()
+}
+
+fn representative_path(app: &AppItem, owned_paths: &[&str]) -> Option<String> {
+    let mut binaries: Vec<&BinaryInfo> = app.binaries.iter().collect();
+    binaries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    if let [binary] = binaries.as_slice() {
+        if binary.name == app.name {
+            return Some(binary.path.clone());
+        }
+    }
+
+    if app.capabilities.has_gui {
+        if let Some(command) = desktop_command_path(app) {
+            return Some(command);
+        }
+    }
+
+    if app.capabilities.has_cli {
+        if let Some(directory) = binary_directory(&binaries) {
+            return Some(directory);
+        }
+    }
+
+    if app.capabilities.has_service {
+        if let Some(command) = service_command_path(app) {
+            return Some(command);
+        }
+    }
+
+    if app.capabilities.has_library {
+        if let Some(library) = best_shared_library_path(&app.name, owned_paths) {
+            return Some(library.to_string());
+        }
+    }
+
+    service_command_path(app)
+        .or_else(|| desktop_command_path(app))
+        .or_else(|| binary_directory(&binaries))
+        .or_else(|| best_owned_path(&app.name, owned_paths).map(str::to_string))
+}
+
+fn service_command_path(app: &AppItem) -> Option<String> {
+    app.services
+        .iter()
+        .filter_map(|service| resolve_exec_program(&service.command, true))
+        .map(|path| path.to_string_lossy().to_string())
+        .min()
+}
+
+fn desktop_command_path(app: &AppItem) -> Option<String> {
+    app.desktop_entries
+        .iter()
+        .filter_map(|entry| resolve_exec_program(&entry.exec, false))
+        .map(|path| path.to_string_lossy().to_string())
+        .min()
+}
+
+fn binary_directory(binaries: &[&BinaryInfo]) -> Option<String> {
+    let mut directories: Vec<&str> = binaries.iter().map(|binary| binary.dir.as_str()).collect();
+    directories.sort_unstable();
+    directories.dedup();
+    directories
+        .first()
+        .map(|directory| (*directory).to_string())
+}
+
+fn best_shared_library_path<'a>(package_name: &str, owned_paths: &'a [&str]) -> Option<&'a str> {
+    let package_stem = normalized_package_stem(package_name);
+    owned_paths
+        .iter()
+        .copied()
+        .filter(|path| {
+            Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|filename| shared_library_stem(filename).is_some())
+        })
+        .min_by_key(|path| owned_path_priority(&package_stem, path))
+}
+
+fn best_owned_path<'a>(package_name: &str, owned_paths: &'a [&str]) -> Option<&'a str> {
+    let package_stem = normalized_package_stem(package_name);
+    owned_paths
+        .iter()
+        .copied()
+        .filter(|path| !Path::new(path).is_dir())
+        .min_by_key(|path| owned_path_priority(&package_stem, path))
+        .or_else(|| owned_paths.iter().copied().min())
+}
+
+fn owned_path_priority(package_stem: &str, path: &str) -> (u8, u8, usize, String) {
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if let Some(library_stem) = shared_library_stem(filename) {
+        let normalized_library = normalized_name(library_stem.trim_start_matches("lib"));
+        let affinity = if normalized_library == package_stem {
+            0
+        } else if normalized_library.starts_with(package_stem)
+            || package_stem.starts_with(&normalized_library)
+        {
+            1
+        } else {
+            2
+        };
+        let versioned = u8::from(filename.ends_with(".so"));
+        return (0, affinity * 2 + versioned, path.len(), path.to_string());
+    }
+
+    let category = if path.starts_with("/usr/bin/") || path.starts_with("/usr/local/bin/") {
+        1
+    } else if path.starts_with("/opt/") {
+        2
+    } else if path.contains("/systemd/") || filename.ends_with(".desktop") {
+        3
+    } else if path.starts_with("/usr/lib/") || path.starts_with("/usr/local/lib/") {
+        4
+    } else if path.contains("/share/doc/")
+        || path.contains("/share/licenses/")
+        || path.contains("/share/man/")
+    {
+        6
+    } else {
+        5
+    };
+    (category, 0, path.len(), path.to_string())
+}
+
+fn shared_library_stem(filename: &str) -> Option<&str> {
+    filename
+        .find(".so")
+        .map(|suffix_start| &filename[..suffix_start])
+        .filter(|stem| stem.starts_with("lib"))
+}
+
+fn normalized_package_stem(package_name: &str) -> String {
+    let name = package_name
+        .strip_prefix('g')
+        .filter(|name| name.starts_with("lib"))
+        .unwrap_or(package_name);
+    normalized_name(name.strip_prefix("lib").unwrap_or(name))
+}
+
+fn normalized_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn origin_is_more_specific(candidate: InstallOrigin, existing: InstallOrigin) -> bool {
     existing == InstallOrigin::Local && candidate != InstallOrigin::Local
+}
+
+fn discovered_install_role(origin: InstallOrigin) -> InstallRole {
+    match origin {
+        InstallOrigin::Cargo | InstallOrigin::Npm | InstallOrigin::Uv => {
+            InstallRole::ToolchainManaged
+        }
+        InstallOrigin::Pacman | InstallOrigin::Aur | InstallOrigin::Local => {
+            InstallRole::Standalone
+        }
+    }
 }
 
 fn push_binary_once(app: &mut AppItem, binary: BinaryInfo) {
@@ -172,6 +409,15 @@ pub(super) fn classify_path(path: &Path, broken: bool) -> (InstallOrigin, Progra
             },
         );
     }
+    if text.contains("/repos/") {
+        return (
+            InstallOrigin::Local,
+            source_checkout_state(path).unwrap_or(ProgramState {
+                unclassified: true,
+                ..ProgramState::default()
+            }),
+        );
+    }
     if text.starts_with("/opt/") {
         return (
             InstallOrigin::Local,
@@ -197,6 +443,68 @@ pub(super) fn classify_path(path: &Path, broken: bool) -> (InstallOrigin, Progra
             ..ProgramState::default()
         },
     )
+}
+
+fn source_checkout_state(path: &Path) -> Option<ProgramState> {
+    let mut current = if path.is_file() || path.is_symlink() {
+        path.parent().map(Path::to_path_buf)
+    } else {
+        Some(path.to_path_buf())
+    };
+
+    while let Some(directory) = current.clone() {
+        if directory.join(".git").exists() {
+            let directory = directory.to_string_lossy();
+            let status = run_git(&["-C", &directory, "status", "--porcelain"]);
+            let remotes = run_git(&["-C", &directory, "remote", "-v"]);
+            let remote_names: HashSet<&str> = remotes
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .collect();
+            let has_fork_remote = remote_names
+                .iter()
+                .any(|remote| matches!(*remote, "github" | "fork" | "upstream" | "personal"));
+            let lower_remotes = remotes.to_lowercase();
+            let has_user_fork =
+                lower_remotes.contains("terrydaktal") || lower_remotes.contains("lewis");
+            let ahead = run_git(&["-C", &directory, "rev-list", "--count", "@{u}..HEAD"])
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
+            let is_fork = !status.trim().is_empty()
+                || remote_names.len() > 1
+                || has_fork_remote
+                || has_user_fork
+                || ahead > 0;
+
+            return Some(if is_fork {
+                ProgramState {
+                    fork: true,
+                    ..ProgramState::default()
+                }
+            } else {
+                ProgramState {
+                    cloned: true,
+                    ..ProgramState::default()
+                }
+            });
+        }
+        let parent = directory.parent().map(Path::to_path_buf);
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+
+    None
+}
+
+fn run_git(arguments: &[&str]) -> String {
+    Command::new("git")
+        .args(arguments)
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 pub(super) fn resolve_exec_program(exec: &str, systemd_specifiers: bool) -> Option<PathBuf> {
@@ -313,6 +621,36 @@ mod tests {
         assert_eq!(
             resolve_exec_program("/usr/bin/python3 /opt/tool/worker.py --watch", true),
             Some(PathBuf::from("/opt/tool/worker.py"))
+        );
+    }
+
+    #[test]
+    fn runtime_library_is_the_representative_path_for_library_packages() {
+        assert_eq!(
+            best_owned_path(
+                "glibc",
+                &[
+                    "/usr/share/licenses/glibc/COPYING",
+                    "/usr/lib/libBrokenLocale.so.1",
+                    "/usr/lib/libc.so",
+                    "/usr/lib/libc.so.6",
+                ],
+            ),
+            Some("/usr/lib/libc.so.6")
+        );
+    }
+
+    #[test]
+    fn toolchain_origins_are_not_classified_as_standalone() {
+        for origin in [InstallOrigin::Cargo, InstallOrigin::Uv, InstallOrigin::Npm] {
+            assert_eq!(
+                discovered_install_role(origin),
+                InstallRole::ToolchainManaged
+            );
+        }
+        assert_eq!(
+            discovered_install_role(InstallOrigin::Local),
+            InstallRole::Standalone
         );
     }
 }

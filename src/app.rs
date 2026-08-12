@@ -3,11 +3,12 @@ use crate::dependency_graph::{
     DependencyGraphNode, DependencyGraphNodeKind,
 };
 use crate::models::{AppItem, BinaryInfo, InstallOrigin, InstallRole, ScanResult};
-use crate::scanner::scan_system;
+use crate::scanner::{load_cached_scan, refresh_system_scan};
 use crate::search::FuzzySearchRanker;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{channel, Receiver};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 pub struct ProgramManagerApp {
     apps: Vec<AppItem>,
@@ -28,10 +29,15 @@ pub struct ProgramManagerApp {
     chk_cargo: bool,
     chk_opt: bool,
     chk_deps: bool,
+    show_uninstalled: bool,
     active_tab: usize,
     dependency_view: RelationshipView,
     used_by_view: RelationshipView,
     graph_zoom: f32,
+    graph_zoom_auto_fit: bool,
+    graph_fit_target: Option<(usize, GraphTraversal)>,
+    path_directories: HashSet<PathBuf>,
+    left_panel_default_width: Option<f32>,
     app_scale: f32,
     show_settings_window: bool,
     rx: Receiver<ScanResult>,
@@ -50,16 +56,17 @@ enum GraphTraversal {
     UsedBy,
 }
 
-const GRAPH_NODE_LIMIT: usize = 120;
+const GRAPH_NODE_LIMIT: usize = 2_000;
 const GRAPH_NODE_WIDTH: f32 = 260.0;
 const GRAPH_NODE_HEIGHT: f32 = 68.0;
 const GRAPH_COLUMN_GAP: f32 = 110.0;
 const GRAPH_ROW_GAP: f32 = 28.0;
 const GRAPH_PADDING: f32 = 24.0;
 const GRAPH_HEADER_HEIGHT: f32 = 48.0;
-const GRAPH_MIN_ZOOM: f32 = 0.5;
+const GRAPH_MIN_ZOOM: f32 = 0.001;
 const GRAPH_MAX_ZOOM: f32 = 2.0;
 const GRAPH_ZOOM_STEP: f32 = 1.2;
+const GRAPH_FIT_MARGIN: f32 = 8.0;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum GraphPortSide {
@@ -76,30 +83,37 @@ struct DependencyBranch<'a> {
 }
 
 fn badge_color(app: &AppItem) -> egui::Color32 {
-    // Dependency status is intentionally a color distinction for Pacman
-    // packages: they retain the [PAC] origin badge but use the legacy grey
-    // dependency color.
-    if app.origin == InstallOrigin::Pacman && app.install_role == InstallRole::Dependency {
-        return egui::Color32::from_rgb(180, 180, 180);
-    }
-
     match app.display_badge() {
-        "PAC" => egui::Color32::from_rgb(16, 185, 129), // Pure Emerald Green
-        "DEV" => egui::Color32::from_rgb(251, 113, 133), // Bright Neon Coral
-        "FRK" => egui::Color32::from_rgb(13, 242, 177), // Mint Teal (Modified Git Fork!)
-        "CLO" => egui::Color32::from_rgb(96, 165, 250), // Sky Slate Blue (Unmodified Cloned Repo!)
-        "UNC" => egui::Color32::from_rgb(113, 113, 122), // Steel Gray (Unclassified Executable!)
-        "BRK" => egui::Color32::from_rgb(82, 82, 91),   // Dark Gray (Broken Executable / Symlink!)
-        "BIN" => egui::Color32::from_rgb(239, 68, 68),  // Crimson Red
-        "SCR" => egui::Color32::from_rgb(249, 115, 22), // Tangerine Orange
-        "OPT" => egui::Color32::from_rgb(250, 204, 21), // Canary Yellow
-        "NPM" => egui::Color32::from_rgb(59, 130, 246), // Royal Blue
-        "CAR" => egui::Color32::from_rgb(198, 91, 50),  // Cargo Rust
-        "CST" => egui::Color32::from_rgb(99, 102, 241), // Indigo
-        "AUR" => egui::Color32::from_rgb(217, 70, 239), // Vibrant Magenta
-        "UV" => egui::Color32::from_rgb(168, 85, 247),  // Electric Purple
-        _ => egui::Color32::from_rgb(180, 180, 180),    // Neutral Silver
+        "PEM" | "PSM" => egui::Color32::from_rgb(16, 185, 129), // Pacman explicit/standalone
+        "PDM" | "ADM" => egui::Color32::from_rgb(180, 180, 180), // Package dependencies
+        "POM" => egui::Color32::from_rgb(120, 120, 128),        // Darker orphan dependency grey
+        "DVM" => egui::Color32::from_rgb(251, 113, 133),        // Bright Neon Coral (Development!)
+        "FKM" => egui::Color32::from_rgb(13, 242, 177),         // Mint Teal (Modified Git Fork!)
+        "CLM" => egui::Color32::from_rgb(96, 165, 250),         // Sky Slate Blue (Cloned Repo!)
+        "UNC" => egui::Color32::from_rgb(113, 113, 122),        // Steel Gray (Unclassified!)
+        "BRK" => egui::Color32::from_rgb(82, 82, 91), // Dark Gray (Broken Executable / Symlink!)
+        "BIU" => egui::Color32::from_rgb(239, 68, 68), // Crimson Red (Unmanaged binary!)
+        "SCU" => egui::Color32::from_rgb(249, 115, 22), // Tangerine Orange (Unmanaged script!)
+        "OPM" => egui::Color32::from_rgb(250, 204, 21), // Canary Yellow (Vendor-managed /opt!)
+        "AEM" | "ASM" => egui::Color32::from_rgb(217, 70, 239), // Vibrant Magenta
+        "UVM" => egui::Color32::from_rgb(168, 85, 247), // uv toolchain-managed
+        "NPM" => egui::Color32::from_rgb(59, 130, 246), // npm toolchain-managed
+        "CAM" => egui::Color32::from_rgb(198, 91, 50), // Cargo toolchain-managed
+        _ => egui::Color32::from_rgb(180, 180, 180),  // Neutral Silver
     }
+}
+
+fn sharing_color(base: egui::Color32, shared: bool) -> egui::Color32 {
+    if shared {
+        return base;
+    }
+    const EXCLUSIVE_BRIGHTNESS: f32 = 0.68;
+    egui::Color32::from_rgba_unmultiplied(
+        (f32::from(base.r()) * EXCLUSIVE_BRIGHTNESS) as u8,
+        (f32::from(base.g()) * EXCLUSIVE_BRIGHTNESS) as u8,
+        (f32::from(base.b()) * EXCLUSIVE_BRIGHTNESS) as u8,
+        base.a(),
+    )
 }
 
 fn version_suffix(version: &str) -> String {
@@ -111,6 +125,14 @@ fn version_suffix(version: &str) -> String {
 }
 
 fn classified_display_text(app: &AppItem, name: &str) -> String {
+    if app.is_suite() {
+        return format!(
+            "[{}] {}{} (suite)",
+            app.display_badge(),
+            name,
+            version_suffix(&app.version)
+        );
+    }
     let capability_suffix = app.capability_suffix();
     let suffix = if capability_suffix.is_empty() {
         String::new()
@@ -130,38 +152,224 @@ fn app_display_text(app: &AppItem) -> String {
     classified_display_text(app, &app.name)
 }
 
+fn start_system_scan(ctx: &egui::Context) -> Receiver<ScanResult> {
+    let (tx, rx) = channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let result = refresh_system_scan();
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+fn tree_classified_display_text(app: &AppItem, name: &str) -> String {
+    classified_display_text(app, name)
+}
+
+fn package_tree_title(app: &AppItem, name: &str) -> String {
+    tree_classified_display_text(app, name)
+}
+
+fn package_tree_location(app: &AppItem) -> &str {
+    if app.representative_path.is_empty() {
+        "path unavailable"
+    } else {
+        &app.representative_path
+    }
+}
+
+fn package_tree_display_text(app: &AppItem, name: &str) -> String {
+    format!(
+        "{} — {}",
+        package_tree_title(app, name),
+        package_tree_location(app)
+    )
+}
+
 fn executable_display_text(app: &AppItem, binary: &BinaryInfo) -> String {
+    format!(
+        "{} — {}",
+        executable_title(app, binary),
+        executable_location(binary)
+    )
+}
+
+fn executable_title(app: &AppItem, binary: &BinaryInfo) -> String {
     let capability_suffix = app.capability_suffix();
     let suffix = if capability_suffix.is_empty() {
         String::new()
     } else {
         format!(" {capability_suffix}")
     };
-    let location = if binary.is_symlink && !binary.target.is_empty() {
-        format!("{} -> {}", binary.path, binary.target)
-    } else {
-        binary.path.clone()
-    };
     format!(
-        "⚡ [{}] {}{}{} — {}",
+        "⚡ [{}] {}{}{}",
         app.display_badge(),
         binary.name,
         version_suffix(&binary.version),
-        suffix,
-        location
+        suffix
     )
 }
 
+fn executable_location(binary: &BinaryInfo) -> String {
+    if binary.is_symlink && !binary.target.is_empty() {
+        format!("{} -> {}", binary.path, binary.target)
+    } else {
+        binary.path.clone()
+    }
+}
+
+fn graph_executable_text(app: &AppItem, binary: &BinaryInfo) -> (String, String) {
+    (executable_title(app, binary), executable_location(binary))
+}
+
+fn graph_package_text(app: &AppItem) -> (String, String) {
+    if app.is_one_to_one_tool() {
+        graph_executable_text(app, &app.binaries[0])
+    } else {
+        (
+            package_tree_title(app, &app.name),
+            package_tree_location(app).to_string(),
+        )
+    }
+}
+
 fn dependency_root_display_text(app: &AppItem) -> String {
-    if app.is_one_to_one_standalone_tool() {
+    if app.is_one_to_one_tool() {
         executable_display_text(app, &app.binaries[0])
     } else {
-        format!("📦 {}", app_display_text(app))
+        format!("📦 {}", package_tree_display_text(app, &app.name))
+    }
+}
+
+fn current_path_directories() -> HashSet<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| std::fs::canonicalize(&directory).unwrap_or(directory))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn binary_is_on_path(binary: &BinaryInfo, path_directories: &HashSet<PathBuf>) -> bool {
+    Path::new(&binary.path)
+        .parent()
+        .map(|directory| {
+            let identity =
+                std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+            path_directories.contains(&identity)
+        })
+        .unwrap_or(false)
+}
+
+fn app_is_on_path(app: &AppItem, path_directories: &HashSet<PathBuf>) -> bool {
+    app.binaries
+        .iter()
+        .any(|binary| binary_is_on_path(binary, path_directories))
+}
+
+fn app_has_desktop_launcher(app: &AppItem) -> bool {
+    app.desktop_entries
+        .iter()
+        .any(|entry| entry.is_visible && !entry.exec.is_empty())
+}
+
+fn is_source_checkout_artifact(app: &AppItem) -> bool {
+    app.state.dev || app.state.fork || app.state.cloned
+}
+
+fn app_should_be_struck(app: &AppItem, path_directories: &HashSet<PathBuf>) -> bool {
+    if app.state.broken {
+        return true;
+    }
+    if is_source_checkout_artifact(app)
+        && !app.binaries.is_empty()
+        && !app_is_on_path(app, path_directories)
+        && !app_has_desktop_launcher(app)
+    {
+        return true;
+    }
+    let has_unowned_executable = app.binaries.iter().any(|binary| {
+        !binary._is_pacman_owned && !binary.path.ends_with(".so") && !binary.path.contains(".so.")
+    });
+    if has_unowned_executable
+        && !app_is_on_path(app, path_directories)
+        && !app_has_desktop_launcher(app)
+        && app.services.is_empty()
+    {
+        return true;
+    }
+    let cli_available = app.capabilities.has_cli && app_is_on_path(app, path_directories);
+    let gui_available = app.capabilities.has_gui
+        && (app_has_desktop_launcher(app) || app_is_on_path(app, path_directories));
+    (app.capabilities.has_cli || app.capabilities.has_gui) && !cli_available && !gui_available
+}
+
+fn binary_should_be_struck(
+    app: &AppItem,
+    binary: &BinaryInfo,
+    path_directories: &HashSet<PathBuf>,
+) -> bool {
+    if app.state.broken {
+        return true;
+    }
+    if app.capabilities.has_gui && app_has_desktop_launcher(app) {
+        return false;
+    }
+    if is_source_checkout_artifact(app) {
+        return !binary_is_on_path(binary, path_directories);
+    }
+    let is_user_facing_cli = app.capabilities.has_cli
+        && (app.capabilities.cli_commands.is_empty()
+            || app
+                .capabilities
+                .cli_commands
+                .iter()
+                .any(|command| command == &binary.name));
+    is_user_facing_cli && !binary_is_on_path(binary, path_directories)
+}
+
+fn strike_if_unavailable(text: egui::RichText, should_strike: bool) -> egui::RichText {
+    if should_strike {
+        text.strikethrough()
+    } else {
+        text
+    }
+}
+
+fn availability_strike(should_strike: bool, color: egui::Color32) -> egui::Stroke {
+    if should_strike {
+        egui::Stroke::new(1.0, color)
+    } else {
+        egui::Stroke::NONE
     }
 }
 
 fn apply_graph_zoom_delta(current: f32, delta: f32) -> f32 {
     (current * delta).clamp(GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM)
+}
+
+fn graph_fit_zoom(base_size: egui::Vec2, viewport_size: egui::Vec2) -> f32 {
+    let usable_size = viewport_size - egui::vec2(GRAPH_FIT_MARGIN, GRAPH_FIT_MARGIN) * 2.0;
+    if base_size.x <= 0.0 || base_size.y <= 0.0 || usable_size.x <= 0.0 || usable_size.y <= 0.0 {
+        return 1.0;
+    }
+    (usable_size.x / base_size.x)
+        .min(usable_size.y / base_size.y)
+        .min(1.0)
+        .clamp(GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM)
+}
+
+fn graph_zoom_label(zoom: f32) -> String {
+    let percentage = zoom * 100.0;
+    if percentage < 1.0 {
+        format!("{percentage:.2}%")
+    } else if percentage < 10.0 {
+        format!("{percentage:.1}%")
+    } else {
+        format!("{percentage:.0}%")
+    }
 }
 
 fn graph_zoom_scroll_adjustment(
@@ -224,18 +432,20 @@ impl ProgramManagerApp {
         style.visuals.dark_mode = true;
         cc.egui_ctx.set_style(style);
 
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let res = scan_system();
-            let _ = tx.send(res);
-        });
+        let cached = load_cached_scan();
+        let (apps, provides_map) = cached
+            .map(|result| (result.apps, result.provides_map))
+            .unwrap_or_default();
+        let mut search_ranker = FuzzySearchRanker::default();
+        search_ranker.rebuild(&apps);
+        let rx = start_system_scan(&cc.egui_ctx);
 
         Self {
-            apps: Vec::new(),
-            provides_map: HashMap::new(),
+            apps,
+            provides_map,
             selected_index: None,
             search_query: String::new(),
-            search_ranker: FuzzySearchRanker::default(),
+            search_ranker,
             chk_pacman: true,
             chk_paru: true,
             chk_dev: true,
@@ -249,10 +459,15 @@ impl ProgramManagerApp {
             chk_cargo: true,
             chk_opt: true,
             chk_deps: true,
+            show_uninstalled: false,
             active_tab: 0, // Default to 📦 Dependencies!
             dependency_view: RelationshipView::Tree,
             used_by_view: RelationshipView::Tree,
             graph_zoom: 1.0,
+            graph_zoom_auto_fit: true,
+            graph_fit_target: None,
+            path_directories: current_path_directories(),
+            left_panel_default_width: None,
             app_scale: 1.2,
             show_settings_window: false,
             rx,
@@ -261,6 +476,9 @@ impl ProgramManagerApp {
     }
 
     fn filter_app(&self, app: &AppItem) -> bool {
+        if self.show_uninstalled != app_should_be_struck(app, &self.path_directories) {
+            return false;
+        }
         if app.install_role == InstallRole::Dependency && !self.chk_deps {
             return false;
         }
@@ -273,7 +491,7 @@ impl ProgramManagerApp {
         if app.state.cloned && !self.chk_clo {
             return false;
         }
-        if app.state.unclassified && !self.chk_unc {
+        if (app.state.unclassified || app.display_badge() == "UNC") && !self.chk_unc {
             return false;
         }
         if app.state.broken && !self.chk_brk {
@@ -303,6 +521,19 @@ impl ProgramManagerApp {
         }
 
         true
+    }
+
+    fn set_uninstalled_view(&mut self, show_uninstalled: bool) {
+        self.show_uninstalled = show_uninstalled;
+        let selected_is_visible = self
+            .selected_index
+            .and_then(|index| self.apps.get(index))
+            .is_none_or(|app| {
+                app_should_be_struck(app, &self.path_directories) == show_uninstalled
+            });
+        if !selected_is_visible {
+            self.selected_index = None;
+        }
     }
 
     fn are_all_filters_on(&self) -> bool {
@@ -429,10 +660,13 @@ impl ProgramManagerApp {
     }
 
     fn render_dependency_tree(&self, ui: &mut egui::Ui, app: &AppItem, max_depth: usize) {
-        let root_label = egui::RichText::new(dependency_root_display_text(app))
-            .color(badge_color(app))
-            .strong();
-        let flatten_standalone_tool = app.is_one_to_one_standalone_tool();
+        let root_label = strike_if_unavailable(
+            egui::RichText::new(dependency_root_display_text(app))
+                .color(badge_color(app))
+                .strong(),
+            app_should_be_struck(app, &self.path_directories),
+        );
+        let flatten_one_to_one_tool = app.is_one_to_one_tool();
 
         if app.binaries.is_empty() && app.depends_on.is_empty() {
             Self::selectable_tree_leaf(ui, "", root_label);
@@ -452,7 +686,7 @@ impl ProgramManagerApp {
             "",
             root_label,
             |ui| {
-                if flatten_standalone_tool {
+                if flatten_one_to_one_tool {
                     let dependency_indent = Self::dependency_tree_indent(1);
                     if app.depends_on.is_empty() {
                         Self::selectable_tree_leaf(
@@ -477,10 +711,12 @@ impl ProgramManagerApp {
                 let executable_indent = Self::dependency_tree_indent(1);
                 let dependency_indent = Self::dependency_tree_indent(2);
                 for binary in &app.binaries {
-                    let executable_label =
+                    let executable_label = strike_if_unavailable(
                         egui::RichText::new(executable_display_text(app, binary))
                             .color(badge_color(app))
-                            .strong();
+                            .strong(),
+                        binary_should_be_struck(app, binary, &self.path_directories),
+                    );
                     let path = vec![app.name.clone(), binary.path.clone()];
 
                     Self::selectable_tree_collapsing_header(
@@ -524,7 +760,7 @@ impl ProgramManagerApp {
             .unwrap_or_else(|| dep_name.to_string());
 
         let app_lookup = self.apps.iter().find(|a| a.name == real_pkg);
-        let package_color = app_lookup
+        let base_package_color = app_lookup
             .map(badge_color)
             .unwrap_or_else(|| egui::Color32::from_rgb(180, 180, 180));
         let req_users: HashSet<String> = if let Some(a) = app_lookup {
@@ -539,6 +775,7 @@ impl ProgramManagerApp {
             .collect();
         other_users.sort_unstable();
         let is_exclusive = other_users.is_empty();
+        let package_color = sharing_color(base_package_color, !is_exclusive);
 
         let total_sharing_apps = req_users.len();
 
@@ -560,23 +797,40 @@ impl ProgramManagerApp {
         } else {
             dep_name.to_string()
         };
-        let package_text = app_lookup
-            .map(|dependency| classified_display_text(dependency, &package_name))
-            .unwrap_or(package_name);
+        let package_title = app_lookup
+            .map(|dependency| package_tree_title(dependency, &package_name))
+            .unwrap_or_else(|| package_name.clone());
+        let package_location = app_lookup
+            .map(package_tree_location)
+            .unwrap_or("path unavailable");
+        let package_should_be_struck = app_lookup
+            .is_some_and(|dependency| app_should_be_struck(dependency, &self.path_directories));
 
         // Every package segment uses the same classification color as the side panel.
         job.append(
-            &format!("{package_text}  "),
+            &package_title,
             0.0,
             egui::TextFormat {
                 font_id: egui::FontId::proportional(14.0),
                 color: package_color,
+                strikethrough: availability_strike(package_should_be_struck, package_color),
                 ..Default::default()
             },
         );
 
         job.append(
-            &format!("—  {}", status_summary),
+            &format!("\n{package_location}"),
+            0.0,
+            egui::TextFormat {
+                color: egui::Color32::from_rgb(155, 162, 175),
+                font_id: egui::FontId::proportional(12.0),
+                strikethrough: availability_strike(package_should_be_struck, package_color),
+                ..Default::default()
+            },
+        );
+
+        job.append(
+            &format!("  —  {}", status_summary),
             0.0,
             egui::TextFormat {
                 color: package_color,
@@ -631,10 +885,16 @@ impl ProgramManagerApp {
         } else {
             ""
         };
-        let root_label =
-            egui::RichText::new(format!("📦 {}{}", app_display_text(app), root_status))
-                .color(badge_color(app))
-                .strong();
+        let root_label = strike_if_unavailable(
+            egui::RichText::new(format!(
+                "📦 {}{}",
+                package_tree_display_text(app, &app.name),
+                root_status
+            ))
+            .color(badge_color(app))
+            .strong(),
+            app_should_be_struck(app, &self.path_directories),
+        );
         let mut users: Vec<&String> = app.required_by.iter().collect();
         users.sort_unstable();
 
@@ -701,18 +961,30 @@ impl ProgramManagerApp {
             + largest_layer as f32 * GRAPH_NODE_HEIGHT
             + largest_layer.saturating_sub(1) as f32 * GRAPH_ROW_GAP)
             .max(260.0);
-        let available_width = ui.available_width();
+        let fit_target = (root_index, traversal);
+        if self.graph_fit_target != Some(fit_target) {
+            self.graph_fit_target = Some(fit_target);
+            self.graph_zoom_auto_fit = true;
+        }
+        if self.graph_zoom_auto_fit {
+            let fitted_zoom = graph_fit_zoom(
+                egui::vec2(base_graph_width, base_graph_height),
+                ui.clip_rect().size(),
+            );
+            if fitted_zoom != self.graph_zoom {
+                self.graph_zoom = fitted_zoom;
+                ui.ctx().request_repaint();
+            }
+        }
         let old_zoom = self.graph_zoom;
-        let old_canvas_size = egui::vec2(
-            (base_graph_width * old_zoom).max(available_width),
-            base_graph_height * old_zoom,
-        );
         let canvas_origin = ui.next_widget_position();
         let pointer_position = ui.input(|input| input.pointer.hover_pos());
-        let pointer_over_graph = pointer_position.is_some_and(|pointer| {
-            egui::Rect::from_min_size(canvas_origin, old_canvas_size).contains(pointer)
-                && ui.clip_rect().contains(pointer)
-        });
+        // The graph lives inside a scrollable panel whose viewport extends
+        // beyond the painted canvas. Treat the whole viewport as the zoom
+        // target so Ctrl+scroll continues to work in the surrounding blank
+        // vertical space as well as over the nodes.
+        let pointer_over_graph =
+            pointer_position.is_some_and(|pointer| ui.clip_rect().contains(pointer));
         if pointer_over_graph {
             let zoom_delta = ui.input(|input| input.zoom_delta());
             let new_zoom = apply_graph_zoom_delta(old_zoom, zoom_delta);
@@ -724,6 +996,7 @@ impl ProgramManagerApp {
                     ui.scroll_with_delta(-scroll_adjustment);
                 }
                 self.graph_zoom = new_zoom;
+                self.graph_zoom_auto_fit = false;
                 ui.ctx().request_repaint();
             }
         }
@@ -818,13 +1091,13 @@ impl ProgramManagerApp {
             let response = ui.interact(rect, id, egui::Sense::click());
             let hovered = response.hovered();
             let clicked = response.clicked();
-            let package_text = self.graph_node_display_text(node);
+            let (title, location) = self.graph_node_text(node);
             let status = self.graph_node_status(&graph, node_index, root_index, traversal);
             if hovered {
                 hovered_node = Some(node_index);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            response.on_hover_text(format!("{package_text}\n{status}"));
+            response.on_hover_text(format!("{title}\n{location}\n{status}"));
             if clicked {
                 selected_index = node.package_index;
             }
@@ -893,10 +1166,24 @@ impl ProgramManagerApp {
                     ..
                 } => badge_color(&self.apps[owner_package_index]),
             };
-            let node_color = if is_related {
+            let is_shared = match node.kind {
+                DependencyGraphNodeKind::Package => {
+                    node_index != 0
+                        && node
+                            .package_index
+                            .is_some_and(|index| self.apps[index].required_by.len() > 1)
+                }
+                DependencyGraphNodeKind::ProvidedTool { .. } => true,
+            };
+            let sharing_adjusted_color = if is_hovered || node_index == 0 {
                 base_color
             } else {
-                Self::color_with_alpha(base_color, 80)
+                sharing_color(base_color, is_shared)
+            };
+            let node_color = if is_related {
+                sharing_adjusted_color
+            } else {
+                Self::color_with_alpha(sharing_adjusted_color, 80)
             };
             let fill = if is_hovered {
                 egui::Color32::from_rgb(48, 57, 70)
@@ -923,18 +1210,38 @@ impl ProgramManagerApp {
                 ),
             );
 
-            let package_text = self.graph_node_display_text(node);
+            let (title, location) = self.graph_node_text(node);
             let status = self.graph_node_status(&graph, node_index, root_index, traversal);
             let text_painter = painter.with_clip_rect(rect.shrink(8.0 * zoom));
-            text_painter.text(
-                rect.left_top() + egui::vec2(10.0, 10.0) * zoom,
+            let title_rect = text_painter.text(
+                rect.left_top() + egui::vec2(10.0, 7.0) * zoom,
                 egui::Align2::LEFT_TOP,
-                &package_text,
+                &title,
                 egui::FontId::proportional(14.0 * zoom),
                 node_color,
             );
+            if self.graph_node_should_be_struck(node) {
+                text_painter.line_segment(
+                    [
+                        egui::pos2(title_rect.left(), title_rect.center().y),
+                        egui::pos2(title_rect.right(), title_rect.center().y),
+                    ],
+                    egui::Stroke::new(1.2 * zoom, node_color),
+                );
+            }
             text_painter.text(
-                rect.left_bottom() + egui::vec2(10.0, -10.0) * zoom,
+                rect.left_top() + egui::vec2(10.0, 27.0) * zoom,
+                egui::Align2::LEFT_TOP,
+                &location,
+                egui::FontId::proportional(12.0 * zoom),
+                if is_related {
+                    egui::Color32::from_rgb(155, 162, 175)
+                } else {
+                    egui::Color32::from_rgb(78, 82, 91)
+                },
+            );
+            text_painter.text(
+                rect.left_bottom() + egui::vec2(10.0, -7.0) * zoom,
                 egui::Align2::LEFT_BOTTOM,
                 &status,
                 egui::FontId::proportional(12.0 * zoom),
@@ -954,7 +1261,7 @@ impl ProgramManagerApp {
             ui.colored_label(
                 egui::Color32::from_rgb(250, 204, 21),
                 format!(
-                    "Graph limited to {GRAPH_NODE_LIMIT} packages; additional {relationship} are hidden. Use the tree for a focused branch view."
+                    "Graph limited to {GRAPH_NODE_LIMIT} nodes; additional {relationship} are hidden. Use the tree for a focused branch view."
                 ),
             );
         }
@@ -972,17 +1279,11 @@ impl ProgramManagerApp {
         let node = &graph.nodes[node_index];
         if let DependencyGraphNodeKind::ProvidedTool {
             owner_package_index,
-            binary_index,
+            ..
         } = node.kind
         {
             let owner = &self.apps[owner_package_index];
-            let binary = &owner.binaries[binary_index];
-            let location = if binary.is_symlink && !binary.target.is_empty() {
-                format!("{} → {}", binary.path, binary.target)
-            } else {
-                binary.path.clone()
-            };
-            return format!("Provided by {} · {location}", owner.name);
+            return format!("Provided by {}", owner.name);
         }
         if traversal == GraphTraversal::Dependencies {
             return self.forward_graph_node_status(graph, node_index, root_index);
@@ -1022,7 +1323,7 @@ impl ProgramManagerApp {
     ) -> String {
         let node = &graph.nodes[node_index];
         if node_index == 0 {
-            let provided_tools = if self.apps[root_index].is_one_to_one_standalone_tool() {
+            let provided_tools = if self.apps[root_index].is_one_to_one_tool() {
                 0
             } else {
                 self.apps[root_index].binaries.len()
@@ -1042,25 +1343,35 @@ impl ProgramManagerApp {
         }
     }
 
-    fn graph_node_display_text(&self, node: &DependencyGraphNode) -> String {
+    fn graph_node_text(&self, node: &DependencyGraphNode) -> (String, String) {
         match node.kind {
             DependencyGraphNodeKind::Package => node.package_index.map_or_else(
-                || node.name.clone(),
-                |index| {
-                    let app = &self.apps[index];
-                    if app.is_one_to_one_standalone_tool() {
-                        executable_display_text(app, &app.binaries[0])
-                    } else {
-                        app_display_text(app)
-                    }
-                },
+                || (node.name.clone(), "path unavailable".to_string()),
+                |index| graph_package_text(&self.apps[index]),
             ),
             DependencyGraphNodeKind::ProvidedTool {
                 owner_package_index,
                 binary_index,
-            } => executable_display_text(
+            } => {
+                let owner = &self.apps[owner_package_index];
+                let binary = &owner.binaries[binary_index];
+                graph_executable_text(owner, binary)
+            }
+        }
+    }
+
+    fn graph_node_should_be_struck(&self, node: &DependencyGraphNode) -> bool {
+        match node.kind {
+            DependencyGraphNodeKind::Package => node.package_index.is_some_and(|index| {
+                app_should_be_struck(&self.apps[index], &self.path_directories)
+            }),
+            DependencyGraphNodeKind::ProvidedTool {
+                owner_package_index,
+                binary_index,
+            } => binary_should_be_struck(
                 &self.apps[owner_package_index],
                 &self.apps[owner_package_index].binaries[binary_index],
+                &self.path_directories,
             ),
         }
     }
@@ -1074,13 +1385,15 @@ impl ProgramManagerApp {
                 .clicked()
             {
                 self.graph_zoom = apply_graph_zoom_delta(self.graph_zoom, 1.0 / GRAPH_ZOOM_STEP);
+                self.graph_zoom_auto_fit = false;
             }
             if ui
-                .button(format!("{:.0}%", self.graph_zoom * 100.0))
-                .on_hover_text("Reset graph zoom to 100%")
+                .button(graph_zoom_label(self.graph_zoom))
+                .on_hover_text("Fit the full graph inside the panel")
                 .clicked()
             {
-                self.graph_zoom = 1.0;
+                self.graph_zoom_auto_fit = true;
+                self.graph_fit_target = None;
             }
             if ui
                 .add_enabled(self.graph_zoom < GRAPH_MAX_ZOOM, egui::Button::new("+"))
@@ -1088,9 +1401,25 @@ impl ProgramManagerApp {
                 .clicked()
             {
                 self.graph_zoom = apply_graph_zoom_delta(self.graph_zoom, GRAPH_ZOOM_STEP);
+                self.graph_zoom_auto_fit = false;
             }
-            ui.weak("Ctrl+scroll or pinch");
+            ui.weak("Ctrl+scroll or pinch · click percentage to fit");
         });
+    }
+
+    fn render_relationship_view_header(
+        ui: &mut egui::Ui,
+        title: &str,
+        view: &mut RelationshipView,
+    ) -> bool {
+        let previous_view = *view;
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(egui::RichText::new(title).strong()).selectable(true));
+            ui.separator();
+            ui.selectable_value(view, RelationshipView::Tree, "🌳 Tree");
+            ui.selectable_value(view, RelationshipView::Graph, "🕸 Graph");
+        });
+        previous_view != *view && *view == RelationshipView::Graph
     }
 
     fn graph_edge_ports(
@@ -1297,7 +1626,7 @@ impl ProgramManagerApp {
         path: &[String],
     ) {
         let package = self.apps.iter().find(|app| app.name == package_name);
-        let package_color = package
+        let base_package_color = package
             .map(badge_color)
             .unwrap_or_else(|| egui::Color32::from_rgb(180, 180, 180));
         let is_cycle = path.iter().any(|ancestor| ancestor == package_name);
@@ -1306,6 +1635,7 @@ impl ProgramManagerApp {
             .map(|app| app.required_by.iter().collect())
             .unwrap_or_default();
         users.sort_unstable();
+        let package_color = sharing_color(base_package_color, users.len() > 1);
 
         let status = if is_cycle {
             "Cycle already shown on this path".to_string()
@@ -1320,20 +1650,36 @@ impl ProgramManagerApp {
         };
 
         let mut job = egui::text::LayoutJob::default();
-        let package_text = package
-            .map(|app| classified_display_text(app, package_name))
+        let package_title = package
+            .map(|app| package_tree_title(app, package_name))
             .unwrap_or_else(|| package_name.to_string());
+        let package_location = package
+            .map(package_tree_location)
+            .unwrap_or("path unavailable");
+        let package_should_be_struck =
+            package.is_some_and(|app| app_should_be_struck(app, &self.path_directories));
         job.append(
-            &format!("{package_text}  "),
+            &package_title,
             0.0,
             egui::TextFormat {
                 font_id: egui::FontId::proportional(14.0),
                 color: package_color,
+                strikethrough: availability_strike(package_should_be_struck, package_color),
                 ..Default::default()
             },
         );
         job.append(
-            &format!("—  {status}"),
+            &format!("\n{package_location}"),
+            0.0,
+            egui::TextFormat {
+                color: egui::Color32::from_rgb(155, 162, 175),
+                font_id: egui::FontId::proportional(12.0),
+                strikethrough: availability_strike(package_should_be_struck, package_color),
+                ..Default::default()
+            },
+        );
+        job.append(
+            &format!("  —  {status}"),
             0.0,
             egui::TextFormat {
                 font_id: egui::FontId::proportional(13.0),
@@ -1369,11 +1715,25 @@ impl ProgramManagerApp {
 impl eframe::App for ProgramManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.is_loading {
-            if let Ok(res) = self.rx.try_recv() {
-                self.apps = res.apps;
-                self.provides_map = res.provides_map;
-                self.search_ranker.rebuild(&self.apps);
-                self.is_loading = false;
+            match self.rx.try_recv() {
+                Ok(res) => {
+                    let selected_name = self
+                        .selected_index
+                        .and_then(|index| self.apps.get(index))
+                        .map(|app| app.name.clone());
+                    self.apps = res.apps;
+                    self.provides_map = res.provides_map;
+                    self.selected_index = selected_name
+                        .and_then(|name| self.apps.iter().position(|app| app.name == name))
+                        .filter(|&index| {
+                            app_should_be_struck(&self.apps[index], &self.path_directories)
+                                == self.show_uninstalled
+                        });
+                    self.search_ranker.rebuild(&self.apps);
+                    self.is_loading = false;
+                }
+                Err(TryRecvError::Disconnected) => self.is_loading = false,
+                Err(TryRecvError::Empty) => {}
             }
         }
 
@@ -1409,21 +1769,22 @@ impl eframe::App for ProgramManagerApp {
                 ui.checkbox(&mut self.chk_clo, "Cloned");
                 ui.checkbox(&mut self.chk_unc, "Unclassified");
                 ui.checkbox(&mut self.chk_brk, "Broken");
-                ui.checkbox(&mut self.chk_bin, "BIN");
-                ui.checkbox(&mut self.chk_scr, "Script");
+                ui.checkbox(&mut self.chk_bin, "BIU");
+                ui.checkbox(&mut self.chk_scr, "SCU");
                 ui.checkbox(&mut self.chk_npm, "NPM");
                 ui.checkbox(&mut self.chk_cargo, "Cargo");
                 ui.checkbox(&mut self.chk_opt, "Opt");
                 ui.checkbox(&mut self.chk_deps, "Deps");
 
-                if ui.button("🔄").clicked() {
+                if ui
+                    .add_enabled(!self.is_loading, egui::Button::new("🔄"))
+                    .clicked()
+                {
                     self.is_loading = true;
-                    let (tx, rx) = channel();
-                    self.rx = rx;
-                    std::thread::spawn(move || {
-                        let res = scan_system();
-                        let _ = tx.send(res);
-                    });
+                    self.rx = start_system_scan(ctx);
+                }
+                if self.is_loading && !self.apps.is_empty() {
+                    ui.spinner().on_hover_text("Refreshing system scan");
                 }
 
                 if ui.button("⚙️ Settings").clicked() {
@@ -1467,7 +1828,7 @@ impl eframe::App for ProgramManagerApp {
                 });
         }
 
-        if self.is_loading {
+        if self.is_loading && self.apps.is_empty() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.centered_and_justified(|ui| {
                     ui.heading(
@@ -1486,7 +1847,11 @@ impl eframe::App for ProgramManagerApp {
             .into_iter()
             .filter(|&index| self.filter_app(&self.apps[index]))
             .collect();
-        let left_width = self.calculate_max_left_width(ctx, &filtered_indices);
+        let left_width = self.left_panel_default_width.unwrap_or_else(|| {
+            let width = self.calculate_max_left_width(ctx, &filtered_indices);
+            self.left_panel_default_width = Some(width);
+            width
+        });
 
         let left_frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
             left: 8.0,
@@ -1502,32 +1867,67 @@ impl eframe::App for ProgramManagerApp {
             .min_width(240.0)
             .max_width(600.0)
             .show(ctx, |ui| {
-                ui.heading("Program List");
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(!self.show_uninstalled, "Installed")
+                        .clicked()
+                    {
+                        self.set_uninstalled_view(false);
+                    }
+                    if ui
+                        .selectable_label(self.show_uninstalled, "Uninstalled")
+                        .clicked()
+                    {
+                        self.set_uninstalled_view(true);
+                    }
+                });
+                ui.heading(if self.show_uninstalled {
+                    "Uninstalled"
+                } else {
+                    "Program List"
+                });
                 ui.separator();
+                if filtered_indices.is_empty() {
+                    ui.label(if self.show_uninstalled {
+                        "No unavailable or off-PATH programs detected."
+                    } else {
+                        "No installed programs match the current filters."
+                    });
+                }
                 egui::ScrollArea::vertical()
                     .id_source("left_program_list_scroll_area")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for &idx in &filtered_indices {
-                            let app = &self.apps[idx];
-                            let is_selected = self.selected_index == Some(idx);
+                    .show_rows(
+                        ui,
+                        ui.spacing().interact_size.y,
+                        filtered_indices.len(),
+                        |ui, row_range| {
+                            for row in row_range {
+                                let idx = filtered_indices[row];
+                                let app = &self.apps[idx];
+                                let is_selected = self.selected_index == Some(idx);
 
-                            let item_color = badge_color(app);
+                                let item_color = badge_color(app);
 
-                            let item_text =
-                                egui::RichText::new(app_display_text(app)).color(if is_selected {
-                                    egui::Color32::WHITE
-                                } else {
-                                    item_color
-                                });
+                                let item_text = strike_if_unavailable(
+                                    egui::RichText::new(app_display_text(app)).color(
+                                        if is_selected {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            item_color
+                                        },
+                                    ),
+                                    app_should_be_struck(app, &self.path_directories),
+                                );
 
-                            let item_response = ui.selectable_label(is_selected, item_text);
+                                let item_response = ui.selectable_label(is_selected, item_text);
 
-                            if item_response.clicked() {
-                                self.selected_index = Some(idx);
+                                if item_response.clicked() {
+                                    self.selected_index = Some(idx);
+                                }
                             }
-                        }
-                    });
+                        },
+                    );
             });
 
         let central_frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin {
@@ -1546,16 +1946,28 @@ impl eframe::App for ProgramManagerApp {
                 if let Some(idx) = self.selected_index {
                     let app = self.apps[idx].clone();
 
-                    ui.label(
+                    ui.label(strike_if_unavailable(
                         egui::RichText::new(&app.name)
                             .heading()
                             .strong()
                             .color(egui::Color32::from_rgb(250, 204, 21)),
-                    );
+                        app_should_be_struck(&app, &self.path_directories),
+                    ));
+                    ui.label(format!("Installation: {}", app.installation_summary()));
+                    ui.label(if !app.capabilities.has_cli {
+                        "PATH: Not applicable (no user-facing CLI)"
+                    } else if app_is_on_path(&app, &self.path_directories) {
+                        "PATH: Available by command name"
+                    } else {
+                        "PATH: User-facing command unavailable"
+                    });
                     ui.label(format!(
-                        "Origin: {}  •  Install role: {}",
-                        app.origin.label(),
-                        app.install_role.label()
+                        "Location: {}",
+                        if app.representative_path.is_empty() {
+                            "Unavailable"
+                        } else {
+                            &app.representative_path
+                        }
                     ));
                     let state_tags = app.state.tag_summary();
                     if !state_tags.is_empty() {
@@ -1614,6 +2026,53 @@ impl eframe::App for ProgramManagerApp {
                     });
                     ui.separator();
 
+                    if self.active_tab == 0 {
+                        let title = match self.dependency_view {
+                            RelationshipView::Tree => "Package Dependency Tree:",
+                            RelationshipView::Graph => "Package Dependency Graph:",
+                        };
+                        let graph_opened = Self::render_relationship_view_header(
+                            ui,
+                            title,
+                            &mut self.dependency_view,
+                        );
+                        if graph_opened {
+                            self.graph_zoom_auto_fit = true;
+                            self.graph_fit_target = None;
+                        }
+                        ui.separator();
+                        if self.dependency_view == RelationshipView::Graph {
+                            self.render_graph_zoom_controls(ui);
+                            ui.label(
+                                "Read left → right: direct and transitive requirements follow dependency order, while genuine leaf dependencies are aligned in the final column. Hover a node to isolate its complete path; click it to inspect the package.",
+                            );
+                            ui.add_space(6.0);
+                            ui.separator();
+                        }
+                    } else if self.active_tab == 1 {
+                        let title = match self.used_by_view {
+                            RelationshipView::Tree => "Reverse Dependency Tree to Explicit Roots:",
+                            RelationshipView::Graph => {
+                                "Reverse Dependency Graph to Explicit Roots:"
+                            }
+                        };
+                        let graph_opened =
+                            Self::render_relationship_view_header(ui, title, &mut self.used_by_view);
+                        if graph_opened {
+                            self.graph_zoom_auto_fit = true;
+                            self.graph_fit_target = None;
+                        }
+                        ui.separator();
+                        if self.used_by_view == RelationshipView::Graph {
+                            self.render_graph_zoom_controls(ui);
+                            ui.label(
+                                "Read left → right: intermediate packages follow dependency order, while every genuine endpoint is aligned in the final terminal-roots column. Hover a node to isolate its complete path; click it to inspect the package.",
+                            );
+                            ui.add_space(6.0);
+                            ui.separator();
+                        }
+                    }
+
                     egui::ScrollArea::both()
                         .id_source("right_inspector_scroll_area")
                         .auto_shrink([false, false])
@@ -1623,38 +2082,11 @@ impl eframe::App for ProgramManagerApp {
                                 0 => {
                                     ui.style_mut().interaction.selectable_labels = true;
                                     ui.style_mut().interaction.multi_widget_text_select = true;
-                                    ui.horizontal(|ui| {
-                                        let title = match self.dependency_view {
-                                            RelationshipView::Tree => "Package Dependency Tree:",
-                                            RelationshipView::Graph => "Package Dependency Graph:",
-                                        };
-                                        ui.add(
-                                            egui::Label::new(egui::RichText::new(title).strong())
-                                                .selectable(true),
-                                        );
-                                        ui.separator();
-                                        ui.selectable_value(
-                                            &mut self.dependency_view,
-                                            RelationshipView::Tree,
-                                            "🌳 Tree",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.dependency_view,
-                                            RelationshipView::Graph,
-                                            "🕸 Graph",
-                                        );
-                                    });
-                                    ui.separator();
                                     match self.dependency_view {
                                         RelationshipView::Tree => {
                                             self.render_dependency_tree(ui, &app, 3);
                                         }
                                         RelationshipView::Graph => {
-                                            self.render_graph_zoom_controls(ui);
-                                            ui.label(
-                                                "Read left → right: direct and transitive requirements follow dependency order, while genuine leaf dependencies are aligned in the final column. Hover a node to isolate its complete path; click it to inspect the package.",
-                                            );
-                                            ui.add_space(6.0);
                                             if let Some(selected_index) = self
                                                 .render_relationship_graph(
                                                     ui,
@@ -1670,42 +2102,11 @@ impl eframe::App for ProgramManagerApp {
                                 1 => {
                                     ui.style_mut().interaction.selectable_labels = true;
                                     ui.style_mut().interaction.multi_widget_text_select = true;
-                                    ui.horizontal(|ui| {
-                                        let title = match self.used_by_view {
-                                            RelationshipView::Tree => {
-                                                "Reverse Dependency Tree to Explicit Roots:"
-                                            }
-                                            RelationshipView::Graph => {
-                                                "Reverse Dependency Graph to Explicit Roots:"
-                                            }
-                                        };
-                                        ui.add(
-                                            egui::Label::new(egui::RichText::new(title).strong())
-                                                .selectable(true),
-                                        );
-                                        ui.separator();
-                                        ui.selectable_value(
-                                            &mut self.used_by_view,
-                                            RelationshipView::Tree,
-                                            "🌳 Tree",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.used_by_view,
-                                            RelationshipView::Graph,
-                                            "🕸 Graph",
-                                        );
-                                    });
-                                    ui.separator();
                                     match self.used_by_view {
                                         RelationshipView::Tree => {
                                             self.render_reverse_dependency_tree(ui, &app);
                                         }
                                         RelationshipView::Graph => {
-                                            self.render_graph_zoom_controls(ui);
-                                            ui.label(
-                                                "Read left → right: intermediate packages follow dependency order, while every genuine endpoint is aligned in the final terminal-roots column. Hover a node to isolate its complete path; click it to inspect the package.",
-                                            );
-                                            ui.add_space(6.0);
                                             if let Some(selected_index) =
                                                 self.render_relationship_graph(
                                                     ui,
@@ -1813,8 +2214,10 @@ impl eframe::App for ProgramManagerApp {
                                 }
                                 _ => {
                                     ui.label(format!("• Name: {}", app.name));
-                                    ui.label(format!("• Origin: {}", app.origin.label()));
-                                    ui.label(format!("• Install role: {}", app.install_role.label()));
+                                    ui.label(format!(
+                                        "• Installation: {}",
+                                        app.installation_summary()
+                                    ));
                                     let state_tags = app.state.tag_summary();
                                     if !state_tags.is_empty() {
                                         ui.label(format!("• State: {state_tags}"));
@@ -1858,11 +2261,18 @@ impl eframe::App for ProgramManagerApp {
                                                 } else {
                                                     format!("[{}]", b.path)
                                                 };
-                                            ui.label(format!(
-                                                "• {}{} {}",
-                                                b.name,
-                                                version_suffix(&b.version),
-                                                loc_bracket
+                                            ui.label(strike_if_unavailable(
+                                                egui::RichText::new(format!(
+                                                    "• {}{} {}",
+                                                    b.name,
+                                                    version_suffix(&b.version),
+                                                    loc_bracket
+                                                )),
+                                                binary_should_be_struck(
+                                                    &app,
+                                                    b,
+                                                    &self.path_directories,
+                                                ),
                                             ));
                                         }
                                     }
@@ -1879,12 +2289,16 @@ impl eframe::App for ProgramManagerApp {
                                 format!("Version: {}\n", app.version)
                             };
                             let text = format!(
-                                "Application: {}\nOrigin: {}\nInstall role: {}\nState: {}\n{}Capabilities: {}\nPrimary role: {}\nSize: {}\nDesc: {}\n",
+                                "Application: {}\nInstallation: {}\nState: {}\n{}Location: {}\nCapabilities: {}\nPrimary role: {}\nSize: {}\nDesc: {}\n",
                                 app.name,
-                                app.origin.label(),
-                                app.install_role.label(),
+                                app.installation_summary(),
                                 app.state.tag_summary(),
                                 version_line,
+                                if app.representative_path.is_empty() {
+                                    "Unavailable"
+                                } else {
+                                    &app.representative_path
+                                },
                                 app.capabilities.tag_summary(),
                                 app.capabilities.primary_role(),
                                 app.size,
@@ -1895,10 +2309,15 @@ impl eframe::App for ProgramManagerApp {
                             }
                         }
                         if ui.button("📁 Open Location").clicked() {
-                            let target_dir = if let Some(b) = app.binaries.first() {
-                                b.dir.clone()
+                            let representative = Path::new(&app.representative_path);
+                            let target_dir = if representative.is_dir() {
+                                representative.to_path_buf()
+                            } else if let Some(parent) = representative.parent() {
+                                parent.to_path_buf()
+                            } else if let Some(b) = app.binaries.first() {
+                                PathBuf::from(&b.dir)
                             } else {
-                                "/usr/bin".to_string()
+                                PathBuf::from("/")
                             };
                             let _ = open::that(target_dir);
                         }
@@ -1945,15 +2364,18 @@ impl eframe::App for ProgramManagerApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_graph_zoom_delta, dependency_column_title, dependency_root_display_text,
-        dependency_sharing_status, dependent_column_title, graph_zoom_scroll_adjustment,
-        used_by_package_status, ProgramManagerApp, GRAPH_MAX_ZOOM, GRAPH_MIN_ZOOM,
+        app_is_on_path, app_should_be_struck, apply_graph_zoom_delta, binary_is_on_path,
+        binary_should_be_struck, dependency_column_title, dependency_root_display_text,
+        dependency_sharing_status, dependent_column_title, graph_fit_zoom, graph_zoom_label,
+        graph_zoom_scroll_adjustment, sharing_color, used_by_package_status, ProgramManagerApp,
+        GRAPH_MAX_ZOOM, GRAPH_MIN_ZOOM,
     };
     use crate::models::{
         AppItem, BinaryInfo, InstallOrigin, InstallRole, PackageCapabilities, ProgramState,
     };
     use eframe::egui;
     use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn dependency_tree_indent_uses_four_spaces_per_level() {
@@ -1963,7 +2385,7 @@ mod tests {
     }
 
     #[test]
-    fn one_to_one_standalone_dependency_roots_use_one_executable_label() {
+    fn one_to_one_dependency_roots_use_one_executable_label() {
         let app = AppItem {
             name: "chunk".to_string(),
             version: String::new(),
@@ -1979,6 +2401,7 @@ mod tests {
             url: String::new(),
             licenses: String::new(),
             _owning_pkg: String::new(),
+            representative_path: "/home/lewis/.local/bin/chunk".to_string(),
             binaries: vec![BinaryInfo {
                 name: "chunk".to_string(),
                 dir: "/home/lewis/.local/bin".to_string(),
@@ -2002,7 +2425,140 @@ mod tests {
 
         assert_eq!(
             dependency_root_display_text(&app),
-            "⚡ [SCR] chunk (cli) — /home/lewis/.local/bin/chunk"
+            "⚡ [SCU] chunk (cli) — /home/lewis/.local/bin/chunk"
+        );
+
+        let path_directories = HashSet::from([PathBuf::from("/home/lewis/.local/bin")]);
+        assert!(binary_is_on_path(&app.binaries[0], &path_directories));
+        assert!(app_is_on_path(&app, &path_directories));
+
+        let mut off_path = app.clone();
+        off_path.binaries[0].dir = "/opt/chunk".to_string();
+        off_path.binaries[0].path = "/opt/chunk/chunk".to_string();
+        assert!(!binary_is_on_path(&off_path.binaries[0], &path_directories));
+        assert!(!app_is_on_path(&off_path, &path_directories));
+        assert!(app_should_be_struck(&off_path, &path_directories));
+        assert!(binary_should_be_struck(
+            &off_path,
+            &off_path.binaries[0],
+            &path_directories
+        ));
+
+        let mut source_service = off_path.clone();
+        source_service.state = ProgramState {
+            cloned: true,
+            ..ProgramState::default()
+        };
+        source_service.capabilities = PackageCapabilities {
+            has_service: true,
+            ..PackageCapabilities::default()
+        };
+        assert!(app_should_be_struck(&source_service, &path_directories));
+        assert!(binary_should_be_struck(
+            &source_service,
+            &source_service.binaries[0],
+            &path_directories
+        ));
+        source_service.binaries[0].dir = "/home/lewis/.local/bin".to_string();
+        source_service.binaries[0].path = "/home/lewis/.local/bin/chunk".to_string();
+        assert!(!app_should_be_struck(&source_service, &path_directories));
+        assert!(!binary_should_be_struck(
+            &source_service,
+            &source_service.binaries[0],
+            &path_directories
+        ));
+
+        let mut library = off_path.clone();
+        library.capabilities = PackageCapabilities {
+            has_library: true,
+            ..PackageCapabilities::default()
+        };
+        library.binaries[0].dir = "/usr/lib".to_string();
+        library.binaries[0].path = "/usr/lib/libchunk.so".to_string();
+        assert!(!app_should_be_struck(&library, &path_directories));
+        assert!(!binary_should_be_struck(
+            &library,
+            &library.binaries[0],
+            &path_directories
+        ));
+
+        let mut unclassified_binary = app.clone();
+        unclassified_binary.capabilities = PackageCapabilities::default();
+        unclassified_binary.binaries[0].dir = "/home/lewis/tasks".to_string();
+        unclassified_binary.binaries[0].path = "/home/lewis/tasks/chunk".to_string();
+        assert!(app_should_be_struck(
+            &unclassified_binary,
+            &path_directories
+        ));
+
+        library.state.broken = true;
+        assert!(app_should_be_struck(&library, &path_directories));
+    }
+
+    #[test]
+    fn multi_tool_cli_packages_use_a_suite_label_in_relationship_views() {
+        let suite = AppItem {
+            name: "btrfs-progs".to_string(),
+            version: "7.1-1".to_string(),
+            origin: InstallOrigin::Pacman,
+            install_role: InstallRole::Explicit,
+            state: ProgramState::default(),
+            size: String::new(),
+            install_date: String::new(),
+            desc: String::new(),
+            url: String::new(),
+            licenses: String::new(),
+            _owning_pkg: "btrfs-progs".to_string(),
+            representative_path: "/usr/bin".to_string(),
+            binaries: vec![
+                BinaryInfo {
+                    name: "btrfs".to_string(),
+                    dir: "/usr/bin".to_string(),
+                    path: "/usr/bin/btrfs".to_string(),
+                    is_symlink: false,
+                    target: String::new(),
+                    version: "v7.1-1".to_string(),
+                    _is_pacman_owned: true,
+                    _owning_pkg: "btrfs-progs".to_string(),
+                },
+                BinaryInfo {
+                    name: "btrfsck".to_string(),
+                    dir: "/usr/bin".to_string(),
+                    path: "/usr/bin/btrfsck".to_string(),
+                    is_symlink: false,
+                    target: String::new(),
+                    version: "v7.1-1".to_string(),
+                    _is_pacman_owned: true,
+                    _owning_pkg: "btrfs-progs".to_string(),
+                },
+            ],
+            required_by: HashSet::new(),
+            depends_on: Vec::new(),
+            desktop_entries: Vec::new(),
+            services: Vec::new(),
+            capabilities: PackageCapabilities {
+                has_cli: true,
+                has_library: true,
+                has_service: true,
+                ..PackageCapabilities::default()
+            },
+        };
+
+        assert!(suite.is_suite());
+        assert_eq!(
+            super::app_display_text(&suite),
+            "[PEM] btrfs-progs (7.1-1) (suite)"
+        );
+        assert_eq!(
+            dependency_root_display_text(&suite),
+            "📦 [PEM] btrfs-progs (7.1-1) (suite) — /usr/bin"
+        );
+        assert_eq!(
+            super::graph_package_text(&suite),
+            (
+                "[PEM] btrfs-progs (7.1-1) (suite)".to_string(),
+                "/usr/bin".to_string()
+            )
         );
     }
 
@@ -2025,6 +2581,17 @@ mod tests {
     fn dependency_nodes_summarize_sharing_without_package_names() {
         assert_eq!(dependency_sharing_status(1), "Exclusive");
         assert_eq!(dependency_sharing_status(22), "Shared by 22 apps");
+    }
+
+    #[test]
+    fn sharing_brightness_preserves_hue_and_mutes_exclusive_nodes() {
+        let base = egui::Color32::from_rgb(200, 100, 50);
+        assert_eq!(sharing_color(base, true), base);
+        let exclusive = sharing_color(base, false);
+        assert!(exclusive.r() < base.r());
+        assert!(exclusive.g() < base.g());
+        assert!(exclusive.b() < base.b());
+        assert_eq!(exclusive.a(), base.a());
     }
 
     #[test]
@@ -2052,7 +2619,31 @@ mod tests {
     fn graph_zoom_scales_and_clamps_to_usable_limits() {
         assert_eq!(apply_graph_zoom_delta(1.0, 1.2), 1.2);
         assert_eq!(apply_graph_zoom_delta(1.9, 2.0), GRAPH_MAX_ZOOM);
-        assert_eq!(apply_graph_zoom_delta(0.6, 0.5), GRAPH_MIN_ZOOM);
+        assert_eq!(
+            apply_graph_zoom_delta(GRAPH_MIN_ZOOM * 2.0, 0.1),
+            GRAPH_MIN_ZOOM
+        );
+        assert_eq!(graph_zoom_label(0.004), "0.40%");
+        assert_eq!(graph_zoom_label(0.42), "42%");
+    }
+
+    #[test]
+    fn graph_default_zoom_fits_both_dimensions_without_enlarging_small_graphs() {
+        assert_eq!(
+            graph_fit_zoom(egui::vec2(2_000.0, 1_000.0), egui::vec2(1_016.0, 516.0)),
+            0.5
+        );
+        assert_eq!(
+            graph_fit_zoom(egui::vec2(400.0, 300.0), egui::vec2(1_000.0, 800.0)),
+            1.0
+        );
+        assert_eq!(
+            graph_fit_zoom(
+                egui::vec2(1_000_000.0, 1_000_000.0),
+                egui::vec2(100.0, 100.0)
+            ),
+            GRAPH_MIN_ZOOM
+        );
     }
 
     #[test]

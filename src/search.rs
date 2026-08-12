@@ -1,58 +1,20 @@
 use crate::models::AppItem;
-use nucleo_matcher::{
-    pattern::{AtomKind, CaseMatching, Normalization, Pattern},
-    Config, Matcher, Utf32Str,
-};
+use fuzzy_rank::fields::fuzzy::{MetadataQuery, PreparedMetadataCandidate, PreparedMetadataField};
+use fuzzy_rank::ranking::SearchRank;
+use std::collections::{HashMap, HashSet};
 
+#[derive(Default)]
 pub struct FuzzySearchRanker {
-    matcher: Matcher,
     documents: Vec<SearchDocument>,
+    relationship_index: HashMap<String, Vec<usize>>,
     last_query: String,
     ranked_indices: Vec<usize>,
-    utf32_buffer: Vec<char>,
 }
 
 struct SearchDocument {
     app_index: usize,
-    name: String,
     sort_name: String,
-    commands: Vec<String>,
-    metadata: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct SearchRank {
-    match_class: u8,
-    fuzzy_score: u32,
-}
-
-#[derive(Clone, Copy)]
-enum SearchField {
-    PackageName,
-    Command,
-    Metadata,
-}
-
-#[derive(Clone, Copy)]
-enum LexicalQuality {
-    Fuzzy,
-    Substring,
-    Prefix,
-    Exact,
-}
-
-impl Default for FuzzySearchRanker {
-    fn default() -> Self {
-        let mut config = Config::DEFAULT;
-        config.prefer_prefix = true;
-        Self {
-            matcher: Matcher::new(config),
-            documents: Vec::new(),
-            last_query: String::new(),
-            ranked_indices: Vec::new(),
-            utf32_buffer: Vec::new(),
-        }
-    }
+    fields: Vec<PreparedMetadataField>,
 }
 
 impl FuzzySearchRanker {
@@ -62,6 +24,18 @@ impl FuzzySearchRanker {
             .enumerate()
             .map(|(app_index, app)| SearchDocument::new(app_index, app))
             .collect();
+        self.relationship_index.clear();
+        for (app_index, app) in apps.iter().enumerate() {
+            for relationship in app.depends_on.iter().chain(&app.required_by) {
+                let relationship = relationship_key(relationship);
+                if !relationship.is_empty() {
+                    self.relationship_index
+                        .entry(relationship)
+                        .or_default()
+                        .push(app_index);
+                }
+            }
+        }
         self.last_query.clear();
         self.ranked_indices = (0..apps.len()).collect();
     }
@@ -83,168 +57,142 @@ impl FuzzySearchRanker {
             return &self.ranked_indices;
         }
 
-        let pattern = Pattern::new(
-            query,
-            CaseMatching::Ignore,
-            Normalization::Smart,
-            AtomKind::Fuzzy,
-        );
-        let folded_query = query.to_lowercase();
-        let documents = &self.documents;
-        let matcher = &mut self.matcher;
-        let utf32_buffer = &mut self.utf32_buffer;
-        let mut ranked = documents
-            .iter()
-            .filter_map(|document| {
-                let mut best_rank = score_field(
-                    &pattern,
-                    matcher,
-                    utf32_buffer,
-                    &document.name,
-                    &folded_query,
-                    SearchField::PackageName,
-                );
+        let search_text = query.to_string();
+        let Some(query) = MetadataQuery::new(query).map(|query| query.with_typo_fallback(true))
+        else {
+            self.ranked_indices.clear();
+            return &self.ranked_indices;
+        };
 
-                for command in &document.commands {
-                    best_rank = best_rank.max(score_field(
-                        &pattern,
-                        matcher,
-                        utf32_buffer,
-                        command,
-                        &folded_query,
-                        SearchField::Command,
-                    ));
+        let mut tiers = std::array::from_fn::<_, 10, _>(|_| Vec::new());
+        let folded_query = search_text.to_lowercase();
+        for document in &self.documents {
+            let candidate = PreparedMetadataCandidate {
+                key: &document.sort_name,
+                fields: &document.fields,
+                score: 0.0,
+            };
+            if let Some(rank) = query.search_rank_prepared(candidate) {
+                let match_class = match_class(&candidate, &folded_query, &rank);
+                tiers[match_class as usize].push((candidate, rank, document.app_index));
+            }
+        }
+
+        // Sort each relevance tier once.  Calling compare_candidates from a
+        // comparison closure rebuilt all lazy metadata relevance for every
+        // comparison, turning a small result set into a large amount of
+        // repeated tokenisation and edit-distance work.
+        self.ranked_indices.clear();
+        for class in (0..=9).rev() {
+            query.sort_matches_prepared_with(&mut tiers[class]);
+            self.ranked_indices
+                .extend(tiers[class].drain(..).map(|(_, _, app_index)| app_index));
+        }
+
+        // Relationships are indexed separately and only match exactly.  They
+        // remain useful search targets without making every fuzzy query scan
+        // thousands of dependency and reverse-dependency names.
+        let relationship_key = relationship_key(&search_text);
+        let mut seen: HashSet<usize> = self.ranked_indices.iter().copied().collect();
+        if let Some(indices) = self.relationship_index.get(&relationship_key) {
+            for &app_index in indices {
+                if seen.insert(app_index) {
+                    self.ranked_indices.push(app_index);
                 }
-
-                best_rank = best_rank.max(score_field(
-                    &pattern,
-                    matcher,
-                    utf32_buffer,
-                    &document.metadata,
-                    &folded_query,
-                    SearchField::Metadata,
-                ));
-                best_rank.map(|rank| (document.app_index, rank, &document.sort_name))
-            })
-            .collect::<Vec<_>>();
-
-        ranked.sort_by(|left, right| {
-            right
-                .1
-                .cmp(&left.1)
-                .then_with(|| left.2.cmp(right.2))
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        self.ranked_indices = ranked
-            .into_iter()
-            .map(|(app_index, _, _)| app_index)
-            .collect();
+            }
+        }
         &self.ranked_indices
+    }
+}
+
+// Keep the app-level relevance tiers explicit: a package name or command is
+// more useful than a match in descriptive metadata, while fuzzy-rank decides
+// the finer ordering inside each tier.
+fn match_class(candidate: &PreparedMetadataCandidate<'_>, query: &str, rank: &SearchRank) -> u8 {
+    let provenance = rank.provenance();
+    let field = candidate
+        .fields
+        .get(provenance.field_index)
+        .map(|field| field.value.as_str())
+        .unwrap_or_default();
+    let quality = if field == query {
+        3
+    } else if field.starts_with(query) {
+        2
+    } else if field.contains(query) {
+        1
+    } else {
+        0
+    };
+
+    let priority = provenance.field_priority;
+    match priority {
+        0 => match quality {
+            3 => 9,
+            2 => 8,
+            1 => 6,
+            _ => 4,
+        },
+        1 => match quality {
+            3 => 7,
+            2 => 5,
+            1 => 3,
+            _ => 2,
+        },
+        _ => 1,
     }
 }
 
 impl SearchDocument {
     fn new(app_index: usize, app: &AppItem) -> Self {
-        let mut commands = Vec::new();
+        let mut fields = Vec::new();
+        push_field(&mut fields, 0, &app.name);
+
         for binary in &app.binaries {
-            commands.push(binary.name.clone());
-            if binary.target != binary.name {
-                commands.push(binary.target.clone());
+            push_field(&mut fields, 1, &binary.name);
+            if !binary.target.is_empty() && binary.target != binary.name {
+                push_field(&mut fields, 1, &binary.target);
             }
         }
         for desktop_entry in &app.desktop_entries {
-            if !desktop_entry.exec.is_empty() {
-                commands.push(desktop_entry.exec.clone());
-            }
+            push_field(&mut fields, 1, &desktop_entry.exec);
+            push_field(&mut fields, 2, &desktop_entry.name);
+            push_field(&mut fields, 3, &desktop_entry.comment);
         }
 
-        let dependency_names = app
-            .depends_on
-            .iter()
-            .chain(&app.required_by)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let desktop_metadata = app
-            .desktop_entries
-            .iter()
-            .flat_map(|entry| [&entry.name, &entry.comment])
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let metadata = format!(
-            "{} {} {} {} {} {} {} {} {} {} {}",
-            app.version,
-            app.origin.label(),
-            app.install_role.label(),
-            app.state.tag_summary(),
-            app.capabilities.tag_summary(),
-            app.capabilities.primary_role(),
-            app.desc,
-            app.url,
-            app.licenses,
-            dependency_names,
-            desktop_metadata,
-        );
+        push_field(&mut fields, 3, &app.desc);
+        push_field(&mut fields, 4, &app.version);
+        push_field(&mut fields, 4, app.origin.label());
+        push_field(&mut fields, 4, app.install_role.label());
+        push_field(&mut fields, 4, app.state.tag_summary());
+        push_field(&mut fields, 4, app.capabilities.tag_summary());
+        push_field(&mut fields, 4, app.capabilities.primary_role());
+        push_field(&mut fields, 4, &app.url);
+        push_field(&mut fields, 4, &app.licenses);
 
         Self {
             app_index,
-            name: app.name.clone(),
             sort_name: app.name.to_lowercase(),
-            commands,
-            metadata,
+            fields,
         }
     }
 }
 
-fn score_field(
-    pattern: &Pattern,
-    matcher: &mut Matcher,
-    utf32_buffer: &mut Vec<char>,
-    text: &str,
-    folded_query: &str,
-    field: SearchField,
-) -> Option<SearchRank> {
-    if text.is_empty() {
-        return None;
-    }
-    utf32_buffer.clear();
-    let fuzzy_score = pattern.score(Utf32Str::new(text, utf32_buffer), matcher)?;
-    let quality = match field {
-        SearchField::Metadata => LexicalQuality::Fuzzy,
-        SearchField::PackageName | SearchField::Command => lexical_quality(text, folded_query),
-    };
-    Some(SearchRank {
-        match_class: match_class(field, quality),
-        fuzzy_score,
-    })
-}
-
-fn lexical_quality(text: &str, folded_query: &str) -> LexicalQuality {
-    let folded_text = text.to_lowercase();
-    if folded_text == folded_query {
-        LexicalQuality::Exact
-    } else if folded_text.starts_with(folded_query) {
-        LexicalQuality::Prefix
-    } else if folded_text.contains(folded_query) {
-        LexicalQuality::Substring
-    } else {
-        LexicalQuality::Fuzzy
+fn push_field(fields: &mut Vec<PreparedMetadataField>, priority: u8, value: impl AsRef<str>) {
+    let value = value.as_ref().trim();
+    if let Some(field) = PreparedMetadataField::new(priority, value) {
+        fields.push(field);
     }
 }
 
-fn match_class(field: SearchField, quality: LexicalQuality) -> u8 {
-    match (field, quality) {
-        (SearchField::PackageName, LexicalQuality::Exact) => 9,
-        (SearchField::PackageName, LexicalQuality::Prefix) => 8,
-        (SearchField::Command, LexicalQuality::Exact) => 7,
-        (SearchField::PackageName, LexicalQuality::Substring) => 6,
-        (SearchField::Command, LexicalQuality::Prefix) => 5,
-        (SearchField::PackageName, LexicalQuality::Fuzzy) => 4,
-        (SearchField::Command, LexicalQuality::Substring) => 3,
-        (SearchField::Command, LexicalQuality::Fuzzy) => 2,
-        (SearchField::Metadata, _) => 1,
-    }
+fn relationship_key(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -268,6 +216,7 @@ mod tests {
             url: String::new(),
             licenses: String::new(),
             _owning_pkg: name.to_string(),
+            representative_path: String::new(),
             binaries: commands
                 .iter()
                 .map(|command| BinaryInfo {
@@ -325,5 +274,16 @@ mod tests {
 
         assert_eq!(ranker.ranked_indices(""), &[0, 1]);
         assert_eq!(ranker.ranked_indices("ffmpeg"), &[1, 0]);
+    }
+
+    #[test]
+    fn exact_relationship_matches_use_the_dedicated_index() {
+        let mut consumer = app("consumer", "application", &[]);
+        consumer.depends_on = vec!["provider-package".to_string()];
+        let apps = vec![consumer];
+        let mut ranker = FuzzySearchRanker::default();
+        ranker.rebuild(&apps);
+
+        assert_eq!(ranker.ranked_indices("provider.package"), &[0]);
     }
 }

@@ -1,4 +1,3 @@
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::thread;
@@ -31,6 +30,7 @@ impl Default for PackageMetadata {
 pub(super) struct PacmanSnapshot {
     pub explicit: PackageVersions,
     pub dependencies: PackageVersions,
+    pub orphan_packages: HashSet<String>,
     pub aur_packages: HashSet<String>,
     pub metadata: HashMap<String, PackageMetadata>,
     pub provides: HashMap<String, String>,
@@ -39,15 +39,17 @@ pub(super) struct PacmanSnapshot {
 }
 
 pub(super) fn scan() -> PacmanSnapshot {
-    let (explicit, dependencies, aur, info, files) = thread::scope(|scope| {
+    let (explicit, dependencies, orphans, aur, info, files) = thread::scope(|scope| {
         let explicit = scope.spawn(|| run_command("pacman", &["-Qe"]));
         let dependencies = scope.spawn(|| run_command("pacman", &["-Qd"]));
+        let orphans = scope.spawn(|| run_command("pacman", &["-Qdtq"]));
         let aur = scope.spawn(|| run_command("pacman", &["-Qm"]));
         let info = scope.spawn(|| run_command("pacman", &["-Qi"]));
         let files = scope.spawn(|| run_command("pacman", &["-Ql"]));
         (
             explicit.join().unwrap_or_default(),
             dependencies.join().unwrap_or_default(),
+            orphans.join().unwrap_or_default(),
             aur.join().unwrap_or_default(),
             info.join().unwrap_or_default(),
             files.join().unwrap_or_default(),
@@ -58,6 +60,7 @@ pub(super) fn scan() -> PacmanSnapshot {
     PacmanSnapshot {
         explicit: parse_package_versions(&explicit),
         dependencies: parse_package_versions(&dependencies),
+        orphan_packages: parse_package_names(&orphans),
         aur_packages: parse_package_names(&aur),
         metadata: query_info.metadata,
         provides: query_info.provides,
@@ -98,55 +101,66 @@ struct QueryInfo {
 }
 
 fn parse_query_info(output: &str) -> QueryInfo {
-    let name_pattern = Regex::new(r"(?m)^Name\s*:\s*(.+)$").expect("valid package name regex");
-    let provides_pattern = Regex::new(r"(?m)^Provides\s*:\s*(.+)$").expect("valid provider regex");
-    let dependencies_pattern =
-        Regex::new(r"(?m)^Depends On\s*:\s*(.+)$").expect("valid dependency regex");
-    let required_by_pattern =
-        Regex::new(r"(?m)^Required By\s*:\s*(.+)$").expect("valid reverse dependency regex");
-    let size_pattern =
-        Regex::new(r"(?m)^Installed Size\s*:\s*(.+)$").expect("valid installed size regex");
-    let date_pattern =
-        Regex::new(r"(?m)^Install Date\s*:\s*(.+)$").expect("valid install date regex");
-    let description_pattern =
-        Regex::new(r"(?m)^Description\s*:\s*(.+)$").expect("valid description regex");
-    let url_pattern = Regex::new(r"(?m)^URL\s*:\s*(.+)$").expect("valid URL regex");
-    let licenses_pattern = Regex::new(r"(?m)^Licenses\s*:\s*(.+)$").expect("valid licenses regex");
-
     let mut metadata = HashMap::new();
     let mut provides = HashMap::new();
     let mut reverse_dependencies = HashMap::new();
 
     for block in output.split("\n\n") {
-        let Some(name) = capture(&name_pattern, block) else {
+        let mut name = None;
+        let mut provides_value = None;
+        let mut dependencies_value = None;
+        let mut required_by_value = None;
+        let mut size = None;
+        let mut install_date = None;
+        let mut description = None;
+        let mut url = None;
+        let mut licenses = None;
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "Name" => name = Some(value),
+                "Provides" => provides_value = Some(value),
+                "Depends On" => dependencies_value = Some(value),
+                "Required By" => required_by_value = Some(value),
+                "Installed Size" => size = Some(value),
+                "Install Date" => install_date = Some(value),
+                "Description" => description = Some(value),
+                "URL" => url = Some(value),
+                "Licenses" => licenses = Some(value),
+                _ => {}
+            }
+        }
+
+        let Some(name) = name else {
             continue;
         };
-        let dependencies = capture(&dependencies_pattern, block)
-            .map(|value| parse_dependency_names(&value))
+        let dependencies = dependencies_value
+            .map(parse_dependency_names)
             .unwrap_or_default();
         metadata.insert(
-            name.clone(),
+            name.to_string(),
             PackageMetadata {
-                size: capture(&size_pattern, block).unwrap_or_else(|| "N/A".to_string()),
-                install_date: capture(&date_pattern, block).unwrap_or_else(|| "N/A".to_string()),
-                description: capture(&description_pattern, block).unwrap_or_default(),
-                url: capture(&url_pattern, block).unwrap_or_default(),
-                licenses: capture(&licenses_pattern, block).unwrap_or_default(),
+                size: size.unwrap_or("N/A").to_string(),
+                install_date: install_date.unwrap_or("N/A").to_string(),
+                description: description.unwrap_or_default().to_string(),
+                url: url.unwrap_or_default().to_string(),
+                licenses: licenses.unwrap_or_default().to_string(),
                 depends_on: dependencies,
             },
         );
 
-        if let Some(required_by) =
-            capture(&required_by_pattern, block).filter(|value| value != "None")
-        {
+        if let Some(required_by) = required_by_value.filter(|value| *value != "None") {
             reverse_dependencies.insert(
-                name.clone(),
+                name.to_string(),
                 required_by.split_whitespace().map(str::to_string).collect(),
             );
         }
-        if let Some(provided) = capture(&provides_pattern, block).filter(|value| value != "None") {
-            for virtual_package in parse_dependency_names(&provided) {
-                provides.insert(virtual_package, name.clone());
+        if let Some(provided) = provides_value.filter(|value| *value != "None") {
+            for virtual_package in parse_dependency_names(provided) {
+                provides.insert(virtual_package, name.to_string());
             }
         }
     }
@@ -156,12 +170,6 @@ fn parse_query_info(output: &str) -> QueryInfo {
         provides,
         reverse_dependencies,
     }
-}
-
-fn capture(pattern: &Regex, input: &str) -> Option<String> {
-    pattern
-        .captures(input)
-        .map(|captures| captures[1].trim().to_string())
 }
 
 fn parse_dependency_names(value: &str) -> Vec<String> {

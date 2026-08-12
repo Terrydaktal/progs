@@ -361,7 +361,7 @@ pub fn build_forward_dependency_graph(
 }
 
 fn add_provided_tools(graph: &mut DependencyGraph, apps: &[AppItem], root_index: usize) {
-    if apps[root_index].binaries.is_empty() || apps[root_index].is_one_to_one_standalone_tool() {
+    if apps[root_index].binaries.is_empty() || apps[root_index].is_one_to_one_tool() {
         return;
     }
 
@@ -503,6 +503,7 @@ mod tests {
             url: String::new(),
             licenses: String::new(),
             _owning_pkg: name.to_string(),
+            representative_path: String::new(),
             binaries: Vec::new(),
             required_by: required_by
                 .iter()
@@ -731,16 +732,16 @@ mod tests {
     }
 
     #[test]
-    fn forward_graph_flattens_a_one_to_one_standalone_tool() {
-        let mut standalone =
-            package_with_dependencies("chunk", InstallRole::Standalone, &["direct-dependency"]);
-        add_tools(&mut standalone, &["chunk"]);
+    fn forward_graph_flattens_a_one_to_one_package_tool() {
+        let mut package_tool =
+            package_with_dependencies("bat", InstallRole::Explicit, &["direct-dependency"]);
+        add_tools(&mut package_tool, &["bat"]);
         let apps = vec![
-            standalone,
+            package_tool,
             package_with_dependencies("direct-dependency", InstallRole::Dependency, &[]),
         ];
 
-        assert!(apps[0].is_one_to_one_standalone_tool());
+        assert!(apps[0].is_one_to_one_tool());
         let graph = build_forward_dependency_graph(&apps, &HashMap::new(), 0, 20);
         let layers = graph.ordered_layers();
 

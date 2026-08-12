@@ -1,6 +1,6 @@
 use super::records::{
     app_key_for_command, binary_for_path, classify_path, resolve_exec_program, upsert,
-    StandaloneRecord,
+    upsert_without_path_merge, StandaloneRecord,
 };
 use crate::models::{AppItem, InstallOrigin, ProgramState, ServiceInfo, ServiceKind};
 use std::collections::{HashMap, HashSet};
@@ -88,12 +88,13 @@ pub(super) fn scan_and_attach(
                     program
                         .as_deref()
                         .and_then(|program| app_key_for_command(apps, program))
+                        .filter(|key| apps.get(key).is_none_or(|app| !is_off_path_source_app(app)))
                 })
                 .or_else(|| {
                     program.as_deref().map(|program| {
                         let broken = !program.exists() && !program.is_symlink();
                         let (origin, state) = classify_path(program, broken);
-                        upsert(
+                        upsert_without_path_merge(
                             apps,
                             StandaloneRecord {
                                 name: name.trim_end_matches(".service").to_string(),
@@ -333,12 +334,13 @@ fn attach_dbus_activators(
                     program
                         .as_deref()
                         .and_then(|program| app_key_for_command(apps, program))
+                        .filter(|key| apps.get(key).is_none_or(|app| !is_off_path_source_app(app)))
                 })
                 .or_else(|| {
                     program.as_deref().map(|program| {
                         let broken = !program.exists() && !program.is_symlink();
                         let (origin, state) = classify_path(program, broken);
-                        upsert(
+                        upsert_without_path_merge(
                             apps,
                             StandaloneRecord {
                                 name: unit_name(&path).trim_end_matches(".service").to_string(),
@@ -385,6 +387,29 @@ fn push_service_once(app: &mut AppItem, service: ServiceInfo) {
     {
         app.services.push(service);
     }
+}
+
+fn is_off_path_source_app(app: &AppItem) -> bool {
+    if !(app.state.dev || app.state.fork || app.state.cloned) {
+        return false;
+    }
+    let path_directories: HashSet<PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| std::fs::canonicalize(&directory).unwrap_or(directory))
+                .collect()
+        })
+        .unwrap_or_default();
+    !app.binaries.iter().any(|binary| {
+        Path::new(&binary.path)
+            .parent()
+            .map(|directory| {
+                let identity =
+                    std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+                path_directories.contains(&identity)
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn unit_name(path: &Path) -> String {

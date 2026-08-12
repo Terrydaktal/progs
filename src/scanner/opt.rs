@@ -1,6 +1,6 @@
 use super::records::{binary_for_path, path_identity, upsert, StandaloneRecord};
 use crate::models::{AppItem, InstallOrigin, ProgramState};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -14,11 +14,12 @@ pub(super) fn scan_and_attach(
     let Ok(entries) = std::fs::read_dir("/opt") else {
         return;
     };
+    let package_owned_roots = package_owned_roots(file_owners);
 
     for entry in entries.flatten() {
         let root = entry.path();
         let root_name = entry.file_name().to_string_lossy().to_string();
-        if !root.is_dir() || root_name.starts_with('.') || root_is_package_owned(&root, file_owners)
+        if !root.is_dir() || root_name.starts_with('.') || package_owned_roots.contains(&root_name)
         {
             continue;
         }
@@ -78,6 +79,13 @@ pub(super) fn scan_and_attach(
             },
         );
         if let Some(app) = apps.get_mut(&key) {
+            if app.representative_path.is_empty() {
+                app.representative_path = if is_matlab_runtime {
+                    root.join("MATLAB_Runtime").to_string_lossy().to_string()
+                } else {
+                    root.to_string_lossy().to_string()
+                };
+            }
             if is_matlab_runtime {
                 app.capabilities.has_library = true;
             } else if opt_install_is_gui(&root_name, launcher.as_deref()) {
@@ -87,9 +95,13 @@ pub(super) fn scan_and_attach(
     }
 }
 
-fn root_is_package_owned(root: &Path, file_owners: &HashMap<String, String>) -> bool {
-    let prefix = format!("{}/", root.to_string_lossy().trim_end_matches('/'));
-    file_owners.keys().any(|path| path.starts_with(&prefix))
+fn package_owned_roots(file_owners: &HashMap<String, String>) -> HashSet<String> {
+    file_owners
+        .keys()
+        .filter_map(|path| path.strip_prefix("/opt/")?.split('/').next())
+        .filter(|root| !root.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn apps_have_executable_under(apps: &HashMap<String, AppItem>, root: &Path) -> bool {

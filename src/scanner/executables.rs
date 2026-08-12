@@ -1,8 +1,8 @@
-use super::records::{upsert, StandaloneRecord};
+use super::records::{path_identity, upsert, StandaloneRecord};
 use crate::models::{AppItem, BinaryInfo, InstallOrigin, ProgramState};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +13,43 @@ use regex::Regex;
 const SKIPPED_SUFFIXES: &[&str] = &[
     ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".bak", ".log", ".lock", ".desktop",
 ];
+const EMBEDDED_VERSION_HEAD_BYTES: u64 = 8 * 1024 * 1024;
+const EMBEDDED_VERSION_TAIL_BYTES: u64 = 1024 * 1024;
+const OPT_EMBEDDED_VERSION_HEAD_BYTES: u64 = 16 * 1024 * 1024;
+const OPT_EMBEDDED_VERSION_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FALLBACK_BINARY_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_FULL_OPT_PROBE_BYTES: u64 = 128 * 1024 * 1024;
+const WORKSPACE_OUTPUT_DIRS: &[&str] = &[
+    "bin",
+    "sbin",
+    "install/bin",
+    "build",
+    "build/bin",
+    "dist",
+    "out",
+    "target/debug",
+    "target/release",
+];
+const WORKSPACE_SUPPORT_EXECUTABLES: &[&str] = &[
+    "autogen.sh",
+    "compile",
+    "config.guess",
+    "config.status",
+    "config.sub",
+    "configure",
+    "depcomp",
+    "install-sh",
+    "ltmain.sh",
+    "missing",
+    "test-driver",
+    "ylwrap",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutableFileKind {
+    NativeBinary,
+    Script,
+}
 
 pub(super) struct ExecutableStats {
     pub binaries: usize,
@@ -25,11 +62,11 @@ pub(super) fn scan(
     file_owners: &HashMap<String, String>,
 ) -> ExecutableStats {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/lewis".to_string());
-    let directories = [
-        PathBuf::from(&home).join(".local/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-    ];
+    let directories = executable_directories(&home);
+    let broken_link_directories = command_directories(&home);
+    let mut embedded_strings_cache: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+    let mut full_opt_probe_paths = HashSet::new();
+    let mut project_version_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut stats = ExecutableStats {
         binaries: 0,
         symlinks: 0,
@@ -42,26 +79,27 @@ pub(super) fn scan(
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == "." || name == ".." || should_skip(&name) {
-                continue;
-            }
-
-            let is_symlink = path.is_symlink();
-            if !is_symlink
-                && entry
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 == 0)
+            if name == "."
+                || name == ".."
+                || should_skip(&name)
+                || should_skip_workspace_support_executable(&directory, &name, &home)
+                || name.ends_with(".so")
+                || name.contains(".so.")
             {
                 continue;
             }
 
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() && !file_type.is_symlink() {
+                continue;
+            }
+            let is_symlink = path.is_symlink();
+
             let path_string = path.to_string_lossy().to_string();
             let owning_package = file_owners.get(&path_string).cloned().unwrap_or_default();
             let is_pacman_owned = !owning_package.is_empty();
-            stats.binaries += 1;
-            if is_symlink {
-                stats.symlinks += 1;
-            }
 
             let target = if is_symlink {
                 std::fs::read_link(&path)
@@ -70,11 +108,37 @@ pub(super) fn scan(
             } else {
                 String::new()
             };
-            let is_script = !is_symlink && has_shebang(&path);
-            let is_broken = is_symlink && !resolved_target(&directory, &target).exists();
+            let executable_path = if is_symlink {
+                resolved_target(&directory, &target)
+            } else {
+                path.clone()
+            };
+            if is_symlink && executable_path.is_dir() {
+                continue;
+            }
+            let is_broken = is_symlink && !executable_path.exists();
+            let executable_kind = if is_broken {
+                if !broken_link_directories.contains(&path_identity(&directory)) {
+                    continue;
+                }
+                None
+            } else {
+                let Some(kind) = executable_file_kind(&executable_path) else {
+                    continue;
+                };
+                Some(kind)
+            };
+            let is_script = executable_kind == Some(ExecutableFileKind::Script);
+            stats.binaries += 1;
+            if is_symlink {
+                stats.symlinks += 1;
+            }
             let project_version = if !is_broken && !is_pacman_owned {
-                let executable_path = resolved_target(&directory, &target);
-                project_version_for_path(&executable_path)
+                let cache_key = path_identity(&executable_path);
+                project_version_cache
+                    .entry(cache_key)
+                    .or_insert_with(|| project_version_for_path(&executable_path))
+                    .clone()
             } else {
                 None
             };
@@ -82,8 +146,29 @@ pub(super) fn scan(
                 if is_broken || is_script || is_pacman_owned {
                     None
                 } else {
-                    let executable_path = resolved_target(&directory, &target);
-                    embedded_binary_version(&executable_path, &name)
+                    let cache_key = path_identity(&executable_path);
+                    let version = embedded_strings_cache
+                        .entry(cache_key.clone())
+                        .or_insert_with(|| {
+                            should_scan_embedded_version(&executable_path)
+                                .then(|| embedded_binary_strings(&executable_path))
+                                .flatten()
+                        })
+                        .as_deref()
+                        .and_then(|strings| version_from_identity_context(strings, &name));
+                    if version.is_some()
+                        || !should_full_opt_probe(&executable_path, &name)
+                        || !full_opt_probe_paths.insert(cache_key.clone())
+                    {
+                        version
+                    } else {
+                        let full_strings = embedded_binary_strings_full(&executable_path);
+                        let version = full_strings
+                            .as_deref()
+                            .and_then(|strings| version_from_identity_context(strings, &name));
+                        embedded_strings_cache.insert(cache_key, full_strings);
+                        version
+                    }
                 }
             });
             let version = if is_broken {
@@ -150,15 +235,173 @@ pub(super) fn scan(
     stats
 }
 
+fn executable_directories(home: &str) -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    directories.extend([
+        PathBuf::from(home).join(".local/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+    ]);
+    directories.extend(workspace_executable_directories(home));
+    directories.extend(unusual_install_directories(home));
+
+    let mut seen = HashSet::new();
+    directories.retain(|directory| {
+        let identity = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.clone());
+        seen.insert(identity)
+    });
+    directories
+}
+
+fn command_directories(home: &str) -> HashSet<PathBuf> {
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    directories.extend([
+        PathBuf::from(home).join(".local/bin"),
+        PathBuf::from(home).join("bin"),
+        PathBuf::from(home).join("sbin"),
+        PathBuf::from(home).join(".cargo/bin"),
+        PathBuf::from(home).join(".npm-global/bin"),
+        PathBuf::from(home).join(".local/libexec"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/local/sbin"),
+        PathBuf::from("/usr/libexec"),
+        PathBuf::from("/usr/local/libexec"),
+        PathBuf::from("/usr/games"),
+    ]);
+    directories
+        .into_iter()
+        .map(|directory| path_identity(&directory))
+        .collect()
+}
+
+fn unusual_install_directories(home: &str) -> Vec<PathBuf> {
+    let mut directories = vec![
+        PathBuf::from(home),
+        PathBuf::from(home).join("bin"),
+        PathBuf::from(home).join("sbin"),
+        PathBuf::from(home).join(".cargo/bin"),
+        PathBuf::from(home).join(".npm-global/bin"),
+        PathBuf::from(home).join(".local/libexec"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/usr/local"),
+        PathBuf::from("/usr/local/lib"),
+        PathBuf::from("/usr/local/sbin"),
+        PathBuf::from("/usr/libexec"),
+        PathBuf::from("/usr/local/libexec"),
+        PathBuf::from("/usr/games"),
+    ];
+    directories.extend(immediate_child_directories(Path::new(home), true));
+    directories.extend(nested_home_directories(Path::new(home)));
+    directories.extend(immediate_child_directories(Path::new("/usr"), false));
+    directories.extend(immediate_child_directories(Path::new("/usr/local"), false));
+    directories
+}
+
+fn nested_home_directories(root: &Path) -> Vec<PathBuf> {
+    const SKIPPED_ROOTS: &[&str] = &[".cache", ".npm", ".rustup", "node_modules"];
+    immediate_child_directories(root, true)
+        .into_iter()
+        .filter(|directory| {
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !SKIPPED_ROOTS.contains(&name))
+        })
+        .flat_map(|directory| immediate_child_directories(&directory, true))
+        .collect()
+}
+
+fn immediate_child_directories(root: &Path, include_hidden: bool) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !include_hidden && name.starts_with('.') {
+                return None;
+            }
+            let file_type = entry.file_type().ok()?;
+            (file_type.is_dir() && !file_type.is_symlink()).then(|| entry.path())
+        })
+        .collect()
+}
+
+fn workspace_executable_directories(home: &str) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    for root in [
+        PathBuf::from(home).join("Dev"),
+        PathBuf::from(home).join("repos"),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        directories.push(root.clone());
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let project = entry.path();
+            directories.extend(workspace_output_directories(&project));
+        }
+    }
+    directories
+}
+
+fn workspace_output_directories(project: &Path) -> Vec<PathBuf> {
+    std::iter::once(project.to_path_buf())
+        .chain(
+            WORKSPACE_OUTPUT_DIRS
+                .iter()
+                .map(|relative| project.join(relative)),
+        )
+        .filter(|directory| directory.is_dir())
+        .collect()
+}
+
 fn should_skip(name: &str) -> bool {
     SKIPPED_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
-fn has_shebang(path: &Path) -> bool {
-    let mut header = [0_u8; 2];
-    File::open(path)
-        .and_then(|mut file| file.read(&mut header))
-        .is_ok_and(|bytes_read| header[..bytes_read].starts_with(b"#!"))
+fn should_skip_workspace_support_executable(directory: &Path, name: &str, home: &str) -> bool {
+    let Some(parent) = directory.parent() else {
+        return false;
+    };
+    let is_project_root =
+        parent == Path::new(home).join("Dev") || parent == Path::new(home).join("repos");
+    is_project_root && WORKSPACE_SUPPORT_EXECUTABLES.contains(&name)
+}
+
+fn executable_file_kind(path: &Path) -> Option<ExecutableFileKind> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return None;
+    }
+
+    let mut header = [0_u8; 4];
+    let bytes_read = File::open(path).ok()?.read(&mut header).ok()?;
+    let header = &header[..bytes_read];
+    if header.starts_with(b"#!") {
+        Some(ExecutableFileKind::Script)
+    } else if header.starts_with(b"\x7fELF") {
+        Some(ExecutableFileKind::NativeBinary)
+    } else {
+        None
+    }
 }
 
 fn resolved_target(directory: &Path, target: &str) -> PathBuf {
@@ -241,14 +484,67 @@ fn manifest_version(contents: &str, section: &str) -> Option<String> {
     None
 }
 
-fn embedded_binary_version(path: &Path, identity: &str) -> Option<String> {
+fn embedded_binary_strings(path: &Path) -> Option<Vec<String>> {
     let metadata = path.metadata().ok()?;
-    if metadata.len() > 256 * 1024 * 1024 {
+    let mut file = File::open(path).ok()?;
+    let file_size = metadata.len();
+    let (head_limit, tail_limit) = if path.starts_with("/opt/") {
+        (
+            OPT_EMBEDDED_VERSION_HEAD_BYTES,
+            OPT_EMBEDDED_VERSION_TAIL_BYTES,
+        )
+    } else {
+        (EMBEDDED_VERSION_HEAD_BYTES, EMBEDDED_VERSION_TAIL_BYTES)
+    };
+    let head_size = file_size.min(head_limit);
+    let mut bytes = Vec::with_capacity(head_size as usize);
+    file.by_ref().take(head_size).read_to_end(&mut bytes).ok()?;
+    let mut strings = printable_strings(&bytes);
+    if file_size > head_size {
+        let tail_size = tail_limit.min(file_size - head_size);
+        file.seek(SeekFrom::End(-(tail_size as i64))).ok()?;
+        let mut tail = Vec::with_capacity(tail_size as usize);
+        file.read_to_end(&mut tail).ok()?;
+        strings.extend(printable_strings(&tail));
+    }
+    Some(strings)
+}
+
+fn embedded_binary_strings_full(path: &Path) -> Option<Vec<String>> {
+    let metadata = path.metadata().ok()?;
+    if metadata.len() > MAX_FULL_OPT_PROBE_BYTES {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
-    let strings = printable_strings(&bytes);
-    version_from_identity_context(&strings, identity)
+    let mut file = File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    Some(printable_strings(&bytes))
+}
+
+fn should_full_opt_probe(path: &Path, identity: &str) -> bool {
+    if !path.starts_with("/opt/") {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(identity)
+        && path
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > OPT_EMBEDDED_VERSION_HEAD_BYTES)
+}
+
+fn should_scan_embedded_version(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    if path.starts_with("/opt/cuda/")
+        || path.starts_with("/usr/lib/jvm/")
+        || path.contains("/.codex/")
+    {
+        return false;
+    }
+    path.starts_with("/opt/")
+        || std::fs::metadata(path.as_ref())
+            .is_ok_and(|metadata| metadata.len() <= MAX_FALLBACK_BINARY_BYTES)
 }
 
 fn printable_strings(bytes: &[u8]) -> Vec<String> {
@@ -529,6 +825,117 @@ mod tests {
         assert!(should_skip("README.md"));
         assert!(should_skip("tool.desktop"));
         assert!(!should_skip("tool"));
+    }
+
+    #[test]
+    fn accepts_only_linux_binaries_and_shebang_scripts() {
+        let root =
+            std::env::temp_dir().join(format!("progs-executable-kind-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cases = [
+            (
+                "native",
+                b"\x7fELFpayload".as_slice(),
+                Some(ExecutableFileKind::NativeBinary),
+            ),
+            (
+                "script",
+                b"#!/bin/sh\nexit 0\n".as_slice(),
+                Some(ExecutableFileKind::Script),
+            ),
+            ("LICENSE", b"MIT License\n".as_slice(), None),
+            (
+                "mimeapps.list",
+                b"[Default Applications]\n".as_slice(),
+                None,
+            ),
+            ("image.png", b"\x89PNG\r\n\x1a\n".as_slice(), None),
+            ("library.dll", b"MZpayload".as_slice(), None),
+        ];
+
+        for (name, contents, expected) in cases {
+            let path = root.join(name);
+            std::fs::write(&path, contents).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            assert_eq!(executable_file_kind(&path), expected, "{name}");
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skips_standard_build_helpers_only_at_workspace_roots() {
+        let home = Path::new("/home/test");
+        let project = home.join("repos/tool");
+        assert!(should_skip_workspace_support_executable(
+            &project,
+            "missing",
+            "/home/test"
+        ));
+        assert!(should_skip_workspace_support_executable(
+            &project,
+            "configure",
+            "/home/test"
+        ));
+        assert!(!should_skip_workspace_support_executable(
+            &project,
+            "tool",
+            "/home/test"
+        ));
+        assert!(!should_skip_workspace_support_executable(
+            &project.join("bin"),
+            "missing",
+            "/home/test"
+        ));
+    }
+
+    #[test]
+    fn executable_directories_include_path_and_deduplicate_aliases() {
+        let directories = executable_directories("/home/test");
+        assert!(directories.contains(&PathBuf::from("/home/test/.local/bin")));
+        assert!(directories.contains(&PathBuf::from("/home/test")));
+        assert!(directories.contains(&PathBuf::from("/home/test/.cargo/bin")));
+        assert!(directories.contains(&PathBuf::from("/home/test/.local/libexec")));
+        assert!(directories.contains(&PathBuf::from("/usr/local/bin")));
+        assert!(directories.contains(&PathBuf::from("/usr/bin")));
+        assert!(directories.contains(&PathBuf::from("/usr/libexec")));
+
+        let identities: HashSet<PathBuf> = directories
+            .iter()
+            .map(|directory| std::fs::canonicalize(directory).unwrap_or_else(|_| directory.clone()))
+            .collect();
+        assert_eq!(identities.len(), directories.len());
+    }
+
+    #[test]
+    fn nested_home_directories_reach_user_task_outputs_without_entering_caches() {
+        let root = std::env::temp_dir().join(format!("progs-home-scan-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("tasks/tobii")).unwrap();
+        std::fs::create_dir_all(root.join(".cache/tool")).unwrap();
+
+        let directories = nested_home_directories(&root);
+        assert!(directories.contains(&root.join("tasks/tobii")));
+        assert!(!directories.contains(&root.join(".cache/tool")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_output_layouts_cover_local_build_artifacts() {
+        let root = std::env::temp_dir().join(format!("progs-workspace-{}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("install/bin")).unwrap();
+        std::fs::create_dir_all(project.join("target/release")).unwrap();
+
+        let directories = workspace_output_directories(&project);
+        assert!(directories.contains(&project));
+        assert!(directories.contains(&project.join("install/bin")));
+        assert!(directories.contains(&project.join("target/release")));
+        assert!(!directories.contains(&project.join("target/debug")));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
